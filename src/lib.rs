@@ -99,10 +99,10 @@ impl PathMapping {
         if !self.dest.as_os_str().is_empty() {
             mapped.push(&self.dest);
         }
-        if let Ok(remainder) = path.strip_prefix(&self.source) {
-            if !remainder.as_os_str().is_empty() {
-                mapped.push(remainder);
-            }
+        if let Ok(remainder) = path.strip_prefix(&self.source)
+            && !remainder.as_os_str().is_empty()
+        {
+            mapped.push(remainder);
         }
         Some(mapped)
     }
