@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
 use git2::{
@@ -49,6 +50,8 @@ pub enum SyncError {
         #[source]
         source: std::io::Error,
     },
+    #[error("git lfs object {oid} referenced by {path} not found")]
+    MissingLfsObject { oid: String, path: PathBuf },
     #[error(transparent)]
     Git(#[from] git2::Error),
 }
@@ -214,7 +217,7 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     diff.find_similar(None)?;
 
     let operations = collect_operations(&diff, temp_dir.path(), &options)?;
-    apply_operations(&dest_repo, &operations)?;
+    apply_operations(&source_repo, &dest_repo, &operations)?;
 
     let mut index = dest_repo.index()?;
     let tree_id = index.write_tree()?;
@@ -416,12 +419,22 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, SyncError> {
     Ok(normalized)
 }
 
-fn apply_operations(repo: &Repository, operations: &[FileOp]) -> Result<(), SyncError> {
-    let workdir = repo
+fn apply_operations(
+    source_repo: &Repository,
+    dest_repo: &Repository,
+    operations: &[FileOp],
+) -> Result<(), SyncError> {
+    let workdir = dest_repo
         .workdir()
         .ok_or(SyncError::BareDestination)?
         .to_path_buf();
-    let mut index = repo.index()?;
+    let lfs_store = source_repo.path().join("lfs").join("objects");
+    let lfs_store = if lfs_store.exists() {
+        Some(lfs_store)
+    } else {
+        None
+    };
+    let mut index = dest_repo.index()?;
     for operation in operations {
         match operation {
             FileOp::Write {
@@ -436,7 +449,7 @@ fn apply_operations(repo: &Repository, operations: &[FileOp]) -> Result<(), Sync
                         source,
                     })?;
                 }
-                copy_entry(source, &dest_path, *filemode)?;
+                copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
                 index.add_path(dest_relative)?;
             }
             FileOp::Delete { dest_relative } => {
@@ -462,7 +475,12 @@ fn apply_operations(repo: &Repository, operations: &[FileOp]) -> Result<(), Sync
     Ok(())
 }
 
-fn copy_entry(source: &Path, dest: &Path, filemode: u32) -> Result<(), SyncError> {
+fn copy_entry(
+    source: &Path,
+    dest: &Path,
+    filemode: u32,
+    lfs_store: Option<&Path>,
+) -> Result<(), SyncError> {
     let metadata = fs::symlink_metadata(source).map_err(|source_err| SyncError::Io {
         path: source.to_path_buf(),
         source: source_err,
@@ -490,13 +508,90 @@ fn copy_entry(source: &Path, dest: &Path, filemode: u32) -> Result<(), SyncError
             source: source_err,
         })?;
     } else {
-        fs::copy(source, dest).map_err(|source_err| SyncError::Io {
+        let resolved = resolve_lfs_pointer(source, lfs_store)?;
+        let copy_source = resolved.as_deref().unwrap_or(source);
+        fs::copy(copy_source, dest).map_err(|source_err| SyncError::Io {
             path: dest.to_path_buf(),
             source: source_err,
         })?;
         set_executable_if_needed(dest, filemode)?;
     }
     Ok(())
+}
+
+fn resolve_lfs_pointer(
+    source: &Path,
+    lfs_store: Option<&Path>,
+) -> Result<Option<PathBuf>, SyncError> {
+    let Some(lfs_root) = lfs_store else {
+        return Ok(None);
+    };
+    let file = match fs::File::open(source) {
+        Ok(file) => file,
+        Err(err) => {
+            return Err(SyncError::Io {
+                path: source.to_path_buf(),
+                source: err,
+            });
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    match reader.read_line(&mut first_line) {
+        Ok(0) => return Ok(None),
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::InvalidData => return Ok(None),
+        Err(err) => {
+            return Err(SyncError::Io {
+                path: source.to_path_buf(),
+                source: err,
+            });
+        }
+    }
+    if first_line.trim_end() != "version https://git-lfs.github.com/spec/v1" {
+        return Ok(None);
+    }
+
+    let mut oid: Option<String> = None;
+    for _ in 0..8 {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::InvalidData => return Ok(None),
+            Err(err) => {
+                return Err(SyncError::Io {
+                    path: source.to_path_buf(),
+                    source: err,
+                });
+            }
+        }
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("oid ") {
+            if let Some(hash) = value.strip_prefix("sha256:") {
+                let hash = hash.trim();
+                if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    oid = Some(hash.to_owned());
+                }
+            }
+            break;
+        }
+    }
+
+    let Some(hash) = oid else {
+        return Ok(None);
+    };
+    if hash.len() < 4 {
+        return Ok(None);
+    }
+    let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
+    if !object_path.exists() {
+        return Err(SyncError::MissingLfsObject {
+            oid: hash,
+            path: source.to_path_buf(),
+        });
+    }
+    Ok(Some(object_path))
 }
 
 fn set_executable_if_needed(dest: &Path, filemode: u32) -> Result<(), SyncError> {
@@ -828,6 +923,55 @@ mod tests {
             fs::read_link(dest_link).unwrap(),
             PathBuf::from("target.txt")
         );
+    }
+
+    #[test]
+    fn sync_copies_lfs_objects() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("Lfs", 1_680_000_000);
+
+        let actual_contents = b"actual file contents\n";
+        let sha = "d396cf496e4d0318a52888cbb121fa38dee59224a60240a56320bac87f5fde8e";
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            sha,
+            actual_contents.len()
+        );
+
+        write_and_stage(&source_repo, Path::new("large.bin"), &pointer);
+
+        let lfs_object_path = source_repo
+            .path()
+            .join("lfs")
+            .join("objects")
+            .join(&sha[0..2])
+            .join(&sha[2..4])
+            .join(sha);
+        fs::create_dir_all(lfs_object_path.parent().unwrap()).unwrap();
+        fs::write(&lfs_object_path, actual_contents).unwrap();
+
+        let lfs_commit = commit(&source_repo, "lfs", &sig);
+
+        sync_commit(
+            SyncOptions::new(
+                source_dir.path().to_path_buf(),
+                dest_dir.path().to_path_buf(),
+                lfs_commit,
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let dest_file = dest_dir.path().join("large.bin");
+        assert_eq!(fs::read(&dest_file).unwrap(), actual_contents);
+
+        let dest_commit = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(dest_commit.summary().unwrap(), "lfs");
     }
 
     #[test]
