@@ -31,6 +31,22 @@ struct Args {
     /// Skip specified paths from being synchronized
     #[arg(long, value_name = "PATH")]
     skip: Vec<std::path::PathBuf>,
+
+    /// Override the author name of the reproduced commit
+    #[arg(long, value_name = "NAME")]
+    author_name: Option<String>,
+
+    /// Override the author email of the reproduced commit
+    #[arg(long, value_name = "EMAIL")]
+    author_email: Option<String>,
+
+    /// Override the committer name of the reproduced commit
+    #[arg(long, value_name = "NAME")]
+    committer_name: Option<String>,
+
+    /// Override the committer email of the reproduced commit
+    #[arg(long, value_name = "EMAIL")]
+    committer_email: Option<String>,
 }
 
 fn main() {
@@ -47,7 +63,11 @@ fn run() -> Result<(), SyncError> {
         source,
     })?;
 
-    let options = SyncOptions::new(args.source, args.dest, oid, args.mappings, args.skip)?;
+    let mut options = SyncOptions::new(args.source, args.dest, oid, args.mappings, args.skip)?;
+    options.author_name = args.author_name;
+    options.author_email = args.author_email;
+    options.committer_name = args.committer_name;
+    options.committer_email = args.committer_email;
 
     sync_commit(options).map(|_| ())
 }
