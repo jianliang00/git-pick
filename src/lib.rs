@@ -467,8 +467,11 @@ fn apply_operations(
                         source,
                     })?;
                 }
-                copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
+                let lfs_object = copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
                 index.add_path(dest_relative)?;
+                if let Some(object) = lfs_object {
+                    materialize_lfs_object(&object, &dest_path, *filemode)?;
+                }
             }
             FileOp::Delete { dest_relative } => {
                 let dest_path = workdir.join(dest_relative);
@@ -498,7 +501,7 @@ fn copy_entry(
     dest: &Path,
     filemode: u32,
     lfs_store: Option<&Path>,
-) -> Result<(), SyncError> {
+) -> Result<Option<PathBuf>, SyncError> {
     let metadata = fs::symlink_metadata(source).map_err(|source_err| SyncError::Io {
         path: source.to_path_buf(),
         source: source_err,
@@ -525,15 +528,24 @@ fn copy_entry(
             path: dest.to_path_buf(),
             source: source_err,
         })?;
+        Ok(None)
     } else {
         let resolved = resolve_lfs_pointer(source, lfs_store)?;
-        let copy_source = resolved.as_deref().unwrap_or(source);
-        fs::copy(copy_source, dest).map_err(|source_err| SyncError::Io {
+        fs::copy(source, dest).map_err(|source_err| SyncError::Io {
             path: dest.to_path_buf(),
             source: source_err,
         })?;
         set_executable_if_needed(dest, filemode)?;
+        Ok(resolved)
     }
+}
+
+fn materialize_lfs_object(object: &Path, dest: &Path, filemode: u32) -> Result<(), SyncError> {
+    fs::copy(object, dest).map_err(|source_err| SyncError::Io {
+        path: dest.to_path_buf(),
+        source: source_err,
+    })?;
+    set_executable_if_needed(dest, filemode)?;
     Ok(())
 }
 
@@ -990,6 +1002,10 @@ mod tests {
 
         let dest_commit = dest_repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(dest_commit.summary().unwrap(), "lfs");
+        let tree = dest_commit.tree().unwrap();
+        let entry = tree.get_path(Path::new("large.bin")).unwrap();
+        let blob = dest_repo.find_blob(entry.id()).unwrap();
+        assert_eq!(blob.content(), pointer.as_bytes());
     }
 
     #[test]
