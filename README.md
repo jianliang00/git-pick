@@ -23,6 +23,29 @@ cargo build --release
 
 The resulting executable can be found at `target/release/git-pick`.
 
+### Portable Linux builds
+
+If you see an error such as `GLIBC_2.32' not found` when running the binary on
+older Linux distributions, build a statically linked executable using the Musl
+target:
+
+```bash
+apt install musl-tools           # provides musl-gcc
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+This produces a portable binary at
+`target/x86_64-unknown-linux-musl/release/git-pick` that does not depend on the
+host's glibc version.
+
+You can also use the helper script `scripts/build-portable.sh`, which installs
+the Musl target if necessary and runs the same build command.
+
+Official GitHub releases publish this Musl-based binary alongside the glibc
+build, so you can download a prebuilt portable executable without rebuilding it
+yourself.
+
 ## Usage
 
 ```
