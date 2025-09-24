@@ -126,6 +126,10 @@ pub struct SyncOptions {
     pub commit: Oid,
     pub mappings: Vec<PathMapping>,
     pub skip: Vec<PathBuf>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
 }
 
 impl SyncOptions {
@@ -146,6 +150,10 @@ impl SyncOptions {
             commit,
             mappings,
             skip: normalized_skip,
+            author_name: None,
+            author_email: None,
+            committer_name: None,
+            committer_email: None,
         })
     }
 }
@@ -233,15 +241,15 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     };
     let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
 
-    let author_sig = Signature::new(
-        author.name().unwrap_or(""),
-        author.email().unwrap_or(""),
-        &author.when(),
+    let author_sig = override_signature(
+        &author,
+        options.author_name.as_deref(),
+        options.author_email.as_deref(),
     )?;
-    let committer_sig = Signature::new(
-        committer.name().unwrap_or(""),
-        committer.email().unwrap_or(""),
-        &committer.when(),
+    let committer_sig = override_signature(
+        &committer,
+        options.committer_name.as_deref(),
+        options.committer_email.as_deref(),
     )?;
 
     let oid = dest_repo.commit(
@@ -391,6 +399,16 @@ fn map_destination(path: &Path, mappings: &[PathMapping]) -> PathBuf {
     }
     best.map(|(mapped, _)| mapped)
         .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn override_signature(
+    base: &Signature,
+    name_override: Option<&str>,
+    email_override: Option<&str>,
+) -> Result<Signature<'static>, git2::Error> {
+    let name = name_override.unwrap_or_else(|| base.name().unwrap_or(""));
+    let email = email_override.unwrap_or_else(|| base.email().unwrap_or(""));
+    Signature::new(name, email, &base.when())
 }
 
 fn should_skip(path: &Path, skip: &[PathBuf]) -> bool {

@@ -34,6 +34,8 @@ git-pick --source <PATH> --dest <PATH> --commit <OID> [--map <SRC=DEST> ...] [--
 - `--commit` – the commit hash from the source repository to replay.
 - `--map` – optional path mappings in the form `source=destination` that rewrite the commit paths.
 - `--skip` – optional paths that should be ignored during synchronisation.
+- `--author-name` / `--author-email` – optional overrides for the author information of the replayed commit.
+- `--committer-name` / `--committer-email` – optional overrides for the committer information of the replayed commit.
 
 ### Example
 

@@ -83,6 +83,47 @@ fn cli_syncs_commit() {
 }
 
 #[test]
+fn cli_overrides_signatures() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    init_repo(dest_dir.path());
+
+    write_and_stage(&source_repo, Path::new("file.txt"), "content");
+    let oid = commit(&source_repo, "override");
+
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &oid,
+            "--author-name",
+            "New Author",
+            "--author-email",
+            "author@example.com",
+            "--committer-name",
+            "New Committer",
+            "--committer-email",
+            "committer@example.com",
+        ])
+        .assert()
+        .success();
+
+    let dest_repo = Repository::open(dest_dir.path()).unwrap();
+    let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+    let author = head.author();
+    assert_eq!(author.name(), Some("New Author"));
+    assert_eq!(author.email(), Some("author@example.com"));
+    let committer = head.committer();
+    assert_eq!(committer.name(), Some("New Committer"));
+    assert_eq!(committer.email(), Some("committer@example.com"));
+}
+
+#[test]
 fn cli_rejects_invalid_commit() {
     let source_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();
