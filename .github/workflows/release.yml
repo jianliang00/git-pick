@@ -22,6 +22,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             ext: ""
@@ -36,6 +39,12 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install musl tooling
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -48,7 +57,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release binary
-        run: cargo build --release --locked
+        if: matrix.target != 'x86_64-unknown-linux-musl'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build portable binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: scripts/build-portable.sh --locked
 
       - name: Prepare artifact
         shell: bash
@@ -57,7 +72,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist
-          SRC="target/release/${BIN_NAME}${EXT}"
+          SRC="target/${TARGET}/release/${BIN_NAME}${EXT}"
           DEST="dist/${BIN_NAME}-${TARGET}${EXT}"
           cp "$SRC" "$DEST"
 
