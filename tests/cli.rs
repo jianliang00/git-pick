@@ -83,6 +83,38 @@ fn cli_syncs_commit() {
 }
 
 #[test]
+fn cli_syncs_commit_copy_mode() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    init_repo(dest_dir.path());
+
+    write_and_stage(&source_repo, Path::new("a/b.txt"), "data");
+    let oid = commit(&source_repo, "cli-copy");
+
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &oid,
+            "--mode",
+            "copy",
+        ])
+        .assert()
+        .success();
+
+    let dest_repo = Repository::open(dest_dir.path()).unwrap();
+    let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.summary().unwrap(), "cli-copy");
+    let file = dest_dir.path().join("a/b.txt");
+    assert_eq!(fs::read_to_string(file).unwrap(), "data");
+}
+
+#[test]
 fn cli_overrides_signatures() {
     let source_dir = tempdir().unwrap();
     let dest_dir = tempdir().unwrap();

@@ -1,12 +1,13 @@
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
 use git2::{
-    DiffOptions, ErrorCode, Oid, Repository, Signature, StatusOptions, build::CheckoutBuilder,
+    ApplyLocation, ApplyOptions, DiffOptions, ErrorCode, Index, IndexEntry, IndexTime, Oid,
+    Repository, Signature, StatusOptions, build::CheckoutBuilder,
 };
-use tempfile::TempDir;
 use thiserror::Error;
+
+mod fs_ops;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -130,6 +131,7 @@ pub struct SyncOptions {
     pub author_email: Option<String>,
     pub committer_name: Option<String>,
     pub committer_email: Option<String>,
+    pub mode: SyncMode,
 }
 
 impl SyncOptions {
@@ -154,8 +156,21 @@ impl SyncOptions {
             author_email: None,
             committer_name: None,
             committer_email: None,
+            mode: SyncMode::Patch,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncMode {
+    Patch,
+    Copy,
+}
+
+#[derive(Clone, Debug)]
+struct BaseEntry {
+    oid: Oid,
+    filemode: u32,
 }
 
 enum FileOp {
@@ -163,9 +178,11 @@ enum FileOp {
         source: PathBuf,
         dest_relative: PathBuf,
         filemode: u32,
+        base: Option<BaseEntry>,
     },
     Delete {
         dest_relative: PathBuf,
+        base: BaseEntry,
     },
 }
 
@@ -208,10 +225,7 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
         source_repo.find_tree(empty_tree_id)?
     };
 
-    let temp_dir = TempDir::new().map_err(|source| SyncError::Io {
-        path: options.source_repo.clone(),
-        source,
-    })?;
+    let temp_dir = fs_ops::create_temp_dir_for(&options.source_repo)?;
     checkout_to_temp(&source_repo, &commit, temp_dir.path())?;
 
     let mut diff_options = DiffOptions::new();
@@ -225,7 +239,14 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     diff.find_similar(None)?;
 
     let operations = collect_operations(&diff, temp_dir.path(), &options)?;
-    apply_operations(&source_repo, &dest_repo, &operations)?;
+    match options.mode {
+        SyncMode::Copy => {
+            apply_operations_copy(&source_repo, &dest_repo, &operations)?;
+        }
+        SyncMode::Patch => {
+            apply_operations_patch(&source_repo, &dest_repo, &operations)?;
+        }
+    }
 
     let mut index = dest_repo.index()?;
     let tree_id = index.write_tree()?;
@@ -291,10 +312,7 @@ fn checkout_to_temp(
     commit: &git2::Commit,
     temp_path: &Path,
 ) -> Result<(), SyncError> {
-    fs::create_dir_all(temp_path).map_err(|source| SyncError::Io {
-        path: temp_path.to_path_buf(),
-        source,
-    })?;
+    fs_ops::create_dir_all(temp_path)?;
     let tree = commit.tree()?;
     let mut checkout = CheckoutBuilder::new();
     checkout.force();
@@ -314,32 +332,36 @@ fn collect_operations(
             git2::Delta::Deleted => {
                 if let Some(old_path) = delta.old_file().path() {
                     let rel = normalize_relative_path(old_path)?;
-                    if should_skip(&rel, &options.skip) {
-                        continue;
+                    if !should_skip(&rel, &options.skip) {
+                        let dest_rel = map_destination(&rel, &options.mappings);
+                        if let Some(base) = base_entry_from_delta(&delta) {
+                            operations.push(FileOp::Delete {
+                                dest_relative: dest_rel,
+                                base,
+                            });
+                        }
                     }
-                    let dest_rel = map_destination(&rel, &options.mappings);
-                    operations.push(FileOp::Delete {
-                        dest_relative: dest_rel,
-                    });
                 }
             }
             git2::Delta::Renamed => {
                 let mut new_rel_opt = None;
                 if let Some(new_path) = delta.new_file().path() {
                     let rel = normalize_relative_path(new_path)?;
-                    if should_skip(&rel, &options.skip) {
-                        continue;
+                    if !should_skip(&rel, &options.skip) {
+                        new_rel_opt = Some(rel);
                     }
-                    new_rel_opt = Some(rel);
                 }
                 if let Some(new_rel) = new_rel_opt {
                     if let Some(old_path) = delta.old_file().path() {
                         let rel = normalize_relative_path(old_path)?;
                         if !should_skip(&rel, &options.skip) {
                             let dest_rel = map_destination(&rel, &options.mappings);
-                            operations.push(FileOp::Delete {
-                                dest_relative: dest_rel,
-                            });
+                            if let Some(base) = base_entry_from_delta(&delta) {
+                                operations.push(FileOp::Delete {
+                                    dest_relative: dest_rel,
+                                    base,
+                                });
+                            }
                         }
                     }
                     let dest_rel = map_destination(&new_rel, &options.mappings);
@@ -348,6 +370,7 @@ fn collect_operations(
                         source: source_path,
                         dest_relative: dest_rel,
                         filemode: delta.new_file().mode().into(),
+                        base: None,
                     });
                 }
             }
@@ -357,16 +380,16 @@ fn collect_operations(
             | git2::Delta::Typechange => {
                 if let Some(new_path) = delta.new_file().path() {
                     let rel = normalize_relative_path(new_path)?;
-                    if should_skip(&rel, &options.skip) {
-                        continue;
+                    if !should_skip(&rel, &options.skip) {
+                        let dest_rel = map_destination(&rel, &options.mappings);
+                        let source_path = temp_root.join(&rel);
+                        operations.push(FileOp::Write {
+                            source: source_path,
+                            dest_relative: dest_rel,
+                            filemode: delta.new_file().mode().into(),
+                            base: base_entry_from_delta(&delta),
+                        });
                     }
-                    let dest_rel = map_destination(&rel, &options.mappings);
-                    let source_path = temp_root.join(&rel);
-                    operations.push(FileOp::Write {
-                        source: source_path,
-                        dest_relative: dest_rel,
-                        filemode: delta.new_file().mode().into(),
-                    });
                 }
             }
             git2::Delta::Unmodified
@@ -381,6 +404,18 @@ fn collect_operations(
         }
     }
     Ok(operations)
+}
+
+fn base_entry_from_delta(delta: &git2::DiffDelta) -> Option<BaseEntry> {
+    let oid = delta.old_file().id();
+    if oid.is_zero() {
+        None
+    } else {
+        Some(BaseEntry {
+            oid,
+            filemode: delta.old_file().mode().into(),
+        })
+    }
 }
 
 fn map_destination(path: &Path, mappings: &[PathMapping]) -> PathBuf {
@@ -437,7 +472,7 @@ fn normalize_relative_path(path: &Path) -> Result<PathBuf, SyncError> {
     Ok(normalized)
 }
 
-fn apply_operations(
+fn apply_operations_copy(
     source_repo: &Repository,
     dest_repo: &Repository,
     operations: &[FileOp],
@@ -459,33 +494,26 @@ fn apply_operations(
                 source,
                 dest_relative,
                 filemode,
+                ..
             } => {
                 let dest_path = workdir.join(dest_relative);
                 if let Some(parent) = dest_path.parent() {
-                    fs::create_dir_all(parent).map_err(|source| SyncError::Io {
-                        path: parent.to_path_buf(),
-                        source,
-                    })?;
+                    fs_ops::create_dir_all(parent)?;
                 }
-                let lfs_object = copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
+                let lfs_object =
+                    fs_ops::copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
                 index.add_path(dest_relative)?;
                 if let Some(object) = lfs_object {
-                    materialize_lfs_object(&object, &dest_path, *filemode)?;
+                    fs_ops::materialize_lfs_object(&object, &dest_path, *filemode)?;
                 }
             }
-            FileOp::Delete { dest_relative } => {
+            FileOp::Delete { dest_relative, .. } => {
                 let dest_path = workdir.join(dest_relative);
                 if let Ok(metadata) = fs::symlink_metadata(&dest_path) {
                     if metadata.file_type().is_dir() {
-                        fs::remove_dir_all(&dest_path).map_err(|source| SyncError::Io {
-                            path: dest_path.clone(),
-                            source,
-                        })?;
+                        fs_ops::remove_dir_all(&dest_path)?;
                     } else {
-                        fs::remove_file(&dest_path).map_err(|source| SyncError::Io {
-                            path: dest_path.clone(),
-                            source,
-                        })?;
+                        fs_ops::remove_file(&dest_path)?;
                     }
                 }
                 index.remove_path(dest_relative)?;
@@ -496,179 +524,140 @@ fn apply_operations(
     Ok(())
 }
 
-fn copy_entry(
-    source: &Path,
-    dest: &Path,
-    filemode: u32,
-    lfs_store: Option<&Path>,
-) -> Result<Option<PathBuf>, SyncError> {
-    let metadata = fs::symlink_metadata(source).map_err(|source_err| SyncError::Io {
-        path: source.to_path_buf(),
-        source: source_err,
-    })?;
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(source).map_err(|source_err| SyncError::Io {
-            path: source.to_path_buf(),
-            source: source_err,
-        })?;
-        if let Ok(existing) = fs::symlink_metadata(dest) {
-            if existing.file_type().is_dir() {
-                fs::remove_dir_all(dest).map_err(|source_err| SyncError::Io {
-                    path: dest.to_path_buf(),
-                    source: source_err,
-                })?;
-            } else {
-                fs::remove_file(dest).map_err(|source_err| SyncError::Io {
-                    path: dest.to_path_buf(),
-                    source: source_err,
-                })?;
-            }
-        }
-        create_symlink(&target, dest).map_err(|source_err| SyncError::Io {
-            path: dest.to_path_buf(),
-            source: source_err,
-        })?;
-        Ok(None)
+fn apply_operations_patch(
+    source_repo: &Repository,
+    dest_repo: &Repository,
+    operations: &[FileOp],
+) -> Result<(), SyncError> {
+    let workdir = dest_repo
+        .workdir()
+        .ok_or(SyncError::BareDestination)?
+        .to_path_buf();
+    let lfs_store = source_repo.path().join("lfs").join("objects");
+    let lfs_store = if lfs_store.exists() {
+        Some(lfs_store)
     } else {
-        let resolved = resolve_lfs_pointer(source, lfs_store)?;
-        fs::copy(source, dest).map_err(|source_err| SyncError::Io {
-            path: dest.to_path_buf(),
-            source: source_err,
-        })?;
-        set_executable_if_needed(dest, filemode)?;
-        Ok(resolved)
-    }
-}
-
-fn materialize_lfs_object(object: &Path, dest: &Path, filemode: u32) -> Result<(), SyncError> {
-    fs::copy(object, dest).map_err(|source_err| SyncError::Io {
-        path: dest.to_path_buf(),
-        source: source_err,
-    })?;
-    set_executable_if_needed(dest, filemode)?;
-    Ok(())
-}
-
-fn resolve_lfs_pointer(
-    source: &Path,
-    lfs_store: Option<&Path>,
-) -> Result<Option<PathBuf>, SyncError> {
-    let Some(lfs_root) = lfs_store else {
-        return Ok(None);
+        None
     };
-    let file = match fs::File::open(source) {
-        Ok(file) => file,
-        Err(err) => {
-            return Err(SyncError::Io {
-                path: source.to_path_buf(),
-                source: err,
-            });
-        }
-    };
-    let mut reader = BufReader::new(file);
-    let mut first_line = String::new();
-    match reader.read_line(&mut first_line) {
-        Ok(0) => return Ok(None),
-        Ok(_) => {}
-        Err(err) if err.kind() == ErrorKind::InvalidData => return Ok(None),
-        Err(err) => {
-            return Err(SyncError::Io {
-                path: source.to_path_buf(),
-                source: err,
-            });
-        }
-    }
-    if first_line.trim_end() != "version https://git-lfs.github.com/spec/v1" {
-        return Ok(None);
-    }
+    let mut base_index = Index::new()?;
+    let mut target_index = Index::new()?;
+    let mut lfs_materializations = Vec::new();
 
-    let mut oid: Option<String> = None;
-    for _ in 0..8 {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::InvalidData => return Ok(None),
-            Err(err) => {
-                return Err(SyncError::Io {
-                    path: source.to_path_buf(),
-                    source: err,
-                });
-            }
-        }
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("oid ") {
-            if let Some(hash) = value.strip_prefix("sha256:") {
-                let hash = hash.trim();
-                if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                    oid = Some(hash.to_owned());
+    for operation in operations {
+        match operation {
+            FileOp::Write {
+                source,
+                dest_relative,
+                filemode,
+                base,
+            } => {
+                if let Some(base_entry) = base {
+                    let base_blob = source_repo.find_blob(base_entry.oid)?;
+                    let base_data = base_blob.content();
+                    let base_oid = dest_repo.blob(base_data)?;
+                    let entry = make_index_entry(
+                        dest_relative,
+                        base_oid,
+                        base_entry.filemode,
+                        base_data.len(),
+                    );
+                    base_index.add(&entry)?;
+                }
+                let data = fs_ops::read_entry_for_patch(source, *filemode)?;
+                let blob = dest_repo.blob(&data)?;
+                let entry = make_index_entry(dest_relative, blob, *filemode, data.len());
+                target_index.add(&entry)?;
+                if let Some(object) = fs_ops::resolve_lfs_pointer(source, lfs_store.as_deref())? {
+                    lfs_materializations.push(LfsMaterialization {
+                        dest_relative: dest_relative.clone(),
+                        object,
+                        filemode: *filemode,
+                    });
                 }
             }
-            break;
-        }
-    }
-
-    let Some(hash) = oid else {
-        return Ok(None);
-    };
-    if hash.len() < 4 {
-        return Ok(None);
-    }
-    let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(&hash);
-    if !object_path.exists() {
-        return Err(SyncError::MissingLfsObject {
-            oid: hash,
-            path: source.to_path_buf(),
-        });
-    }
-    Ok(Some(object_path))
-}
-
-fn set_executable_if_needed(dest: &Path, filemode: u32) -> Result<(), SyncError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let executable = filemode & 0o111 != 0;
-        if let Ok(metadata) = fs::metadata(dest) {
-            let mut permissions = metadata.permissions();
-            let mut mode = permissions.mode();
-            let current_exec = mode & 0o111 != 0;
-            if executable != current_exec {
-                mode = if executable {
-                    mode | 0o111
-                } else {
-                    mode & !0o111
-                };
-                permissions.set_mode(mode);
-                fs::set_permissions(dest, permissions).map_err(|source_err| SyncError::Io {
-                    path: dest.to_path_buf(),
-                    source: source_err,
-                })?;
+            FileOp::Delete {
+                dest_relative,
+                base,
+            } => {
+                let base_blob = source_repo.find_blob(base.oid)?;
+                let base_data = base_blob.content();
+                let base_oid = dest_repo.blob(base_data)?;
+                let entry =
+                    make_index_entry(dest_relative, base_oid, base.filemode, base_data.len());
+                base_index.add(&entry)?;
             }
         }
     }
-    #[cfg(not(unix))]
-    let _ = (dest, filemode);
+
+    let mut diff_opts = DiffOptions::new();
+    diff_opts.include_typechange(true);
+    diff_opts.include_typechange_trees(true);
+    let diff = dest_repo.diff_index_to_index(&base_index, &target_index, Some(&mut diff_opts))?;
+    if diff.deltas().len() == 0 {
+        return Ok(());
+    }
+
+    let mut apply_opts = ApplyOptions::new();
+    dest_repo.apply(&diff, ApplyLocation::Both, Some(&mut apply_opts))?;
+
+    for materialization in lfs_materializations {
+        let dest_path = workdir.join(&materialization.dest_relative);
+        fs_ops::materialize_lfs_object(
+            &materialization.object,
+            &dest_path,
+            materialization.filemode,
+        )?;
+    }
+
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
+struct LfsMaterialization {
+    dest_relative: PathBuf,
+    object: PathBuf,
+    filemode: u32,
 }
 
-#[cfg(windows)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::{symlink_dir, symlink_file};
-    if fs::metadata(target).map(|m| m.is_dir()).unwrap_or(false) {
-        symlink_dir(target, link)
-    } else {
-        symlink_file(target, link)
+fn make_index_entry(path: &Path, blob: Oid, filemode: u32, size: usize) -> IndexEntry {
+    let path_bytes = path_to_repo_bytes(path);
+    IndexEntry {
+        ctime: IndexTime::new(0, 0),
+        mtime: IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: filemode,
+        uid: 0,
+        gid: 0,
+        file_size: (size.min(u32::MAX as usize)) as u32,
+        id: blob,
+        flags: index_flags_for_len(path_bytes.len()),
+        flags_extended: 0,
+        path: path_bytes,
     }
+}
+
+fn index_flags_for_len(len: usize) -> u16 {
+    let capped = len.min(0x0FFF);
+    capped as u16
+}
+
+fn path_to_repo_bytes(path: &Path) -> Vec<u8> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let components: Vec<String> = path
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    components.join("/").into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fs_ops::{
+        copy_entry, create_dir_all, materialize_lfs_object, os_str_to_bytes, read_entry_for_patch,
+        remove_dir_all, remove_file, resolve_lfs_pointer, set_executable_if_needed,
+    };
     use super::*;
     use git2::{RepositoryInitOptions, Signature, Time};
     use tempfile::tempdir;
@@ -743,6 +732,35 @@ mod tests {
             vec![],
         )
         .unwrap();
+
+        let new_oid = sync_commit(options).unwrap();
+        let dest_commit = dest_repo.find_commit(new_oid).unwrap();
+        assert_eq!(dest_commit.author().name().unwrap(), "Alice");
+        assert_eq!(dest_commit.author().when().seconds(), 1_234_567_890);
+        let contents = fs::read_to_string(dest_dir.path().join("file.txt")).unwrap();
+        assert_eq!(contents, "hello");
+    }
+
+    #[test]
+    fn sync_basic_commit_copy_mode() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        let sig = test_signature("Alice", 1_234_567_890);
+        write_and_stage(&source_repo, Path::new("file.txt"), "hello");
+        let oid = commit(&source_repo, "initial", &sig);
+
+        let mut options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        options.mode = SyncMode::Copy;
 
         let new_oid = sync_commit(options).unwrap();
         let dest_commit = dest_repo.find_commit(new_oid).unwrap();
@@ -905,6 +923,35 @@ mod tests {
             fs::read_to_string(dest_dir.path().join("renamed.txt")).unwrap(),
             "data"
         );
+    }
+
+    #[test]
+    fn patch_mode_errors_on_conflict() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("Conflicted", 1_750_000_000);
+
+        write_and_stage(&source_repo, Path::new("file.txt"), "base");
+        commit(&source_repo, "base", &sig);
+        write_and_stage(&source_repo, Path::new("file.txt"), "source update");
+        let source_commit = commit(&source_repo, "update", &sig);
+
+        write_and_stage(&dest_repo, Path::new("file.txt"), "dest change");
+        commit(&dest_repo, "dest", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            source_commit,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
     }
 
     #[cfg(unix)]
@@ -1269,5 +1316,729 @@ mod tests {
             SyncError::DirtyDestination => {}
             other => panic!("unexpected error {other:?}"),
         }
+    }
+
+    #[test]
+    fn override_signature_applies_overrides() {
+        let base = test_signature("Base", 1_900_000_000);
+        let overridden =
+            override_signature(&base, Some("Other"), Some("other@example.com")).unwrap();
+        assert_eq!(overridden.name(), Some("Other"));
+        assert_eq!(overridden.email(), Some("other@example.com"));
+
+        let fallback = override_signature(&base, None, None).unwrap();
+        assert_eq!(fallback.name(), base.name());
+        assert_eq!(fallback.email(), base.email());
+    }
+
+    #[test]
+    fn index_and_path_helpers_cover_branches() {
+        assert_eq!(index_flags_for_len(0), 0);
+        assert_eq!(index_flags_for_len(0x2000), 0x0FFF);
+
+        assert!(path_to_repo_bytes(Path::new("")).is_empty());
+        assert_eq!(
+            path_to_repo_bytes(Path::new("dir/name")),
+            b"dir/name".to_vec()
+        );
+    }
+
+    #[test]
+    fn read_entry_for_patch_handles_regular_and_symlink() {
+        let dir = tempdir().unwrap();
+        let regular = dir.path().join("regular.txt");
+        fs::write(&regular, "contents").unwrap();
+        let data = read_entry_for_patch(&regular, 0o100644).unwrap();
+        assert_eq!(data, b"contents");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+
+            let target = dir.path().join("target.txt");
+            fs::write(&target, "symlink-target").unwrap();
+            let link = dir.path().join("link");
+            unix_fs::symlink(&target, &link).unwrap();
+
+            let link_data = read_entry_for_patch(&link, 0o120000).unwrap();
+            assert_eq!(link_data, os_str_to_bytes(target.as_os_str()));
+        }
+    }
+
+    #[test]
+    fn set_executable_if_needed_toggles_permissions() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("script.sh");
+        fs::write(&file, "echo hi").unwrap();
+
+        set_executable_if_needed(&file, 0o100755).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&file).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+
+        set_executable_if_needed(&file, 0o100644).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0);
+        }
+    }
+
+    #[test]
+    fn materialize_lfs_object_copies_and_sets_mode() {
+        let dir = tempdir().unwrap();
+        let object = dir.path().join("object.dat");
+        let dest = dir.path().join("dest.dat");
+        fs::write(&object, b"payload").unwrap();
+
+        materialize_lfs_object(&object, &dest, 0o100755).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dest).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+    }
+
+    #[test]
+    fn fs_helper_wrappers_manage_dirs_and_files() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("parent/child");
+        create_dir_all(&nested).unwrap();
+        assert!(nested.exists());
+
+        let file_path = dir.path().join("file.txt");
+        fs::write(&file_path, "temp").unwrap();
+        remove_file(&file_path).unwrap();
+        assert!(!file_path.exists());
+
+        let dir_path = dir.path().join("to_remove");
+        fs::create_dir_all(&dir_path).unwrap();
+        remove_dir_all(&dir_path).unwrap();
+        assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn copy_entry_covers_regular_and_symlink_and_lfs() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        let regular_src = src_dir.join("script.sh");
+        fs::write(&regular_src, "#!/bin/sh\necho hi\n").unwrap();
+        let regular_dest = dest_dir.join("script.sh");
+        let resolved = copy_entry(&regular_src, &regular_dest, 0o100755, None).unwrap();
+        assert!(resolved.is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&regular_dest).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0);
+        }
+
+        let lfs_root = src_dir.join("lfs").join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+        let hash = "9d0b5e1423f8a0a2f4f2b8d74d07d377c6e6f4c4f8b4f6a8d0c2e4b6a0c8d2e4";
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 4\n",
+            hash
+        );
+        let pointer_src = src_dir.join("pointer.bin");
+        fs::write(&pointer_src, pointer).unwrap();
+        let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"blob").unwrap();
+        let pointer_dest = dest_dir.join("pointer.bin");
+        let resolved = copy_entry(&pointer_src, &pointer_dest, 0o100644, Some(&lfs_root)).unwrap();
+        assert_eq!(resolved.unwrap(), object_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs as unix_fs;
+            let target = src_dir.join("target.txt");
+            fs::write(&target, "symlink").unwrap();
+            let link_src = src_dir.join("link.txt");
+            unix_fs::symlink(&target, &link_src).unwrap();
+            let link_dest = dest_dir.join("link.txt");
+            copy_entry(&link_src, &link_dest, 0o120000, None).unwrap();
+            assert!(
+                fs::symlink_metadata(&link_dest)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            let dir_dest = dest_dir.join("link_dir");
+            fs::create_dir_all(&dir_dest).unwrap();
+            copy_entry(&link_src, &dir_dest, 0o120000, None).unwrap();
+            assert!(
+                fs::symlink_metadata(&dir_dest)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+
+            let file_dest = dest_dir.join("link_file");
+            fs::write(&file_dest, "old").unwrap();
+            copy_entry(&link_src, &file_dest, 0o120000, None).unwrap();
+            assert!(
+                fs::symlink_metadata(&file_dest)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_handles_various_cases() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        fs::write(&pointer, "version https://git-lfs.github.com/spec/v1\n").unwrap();
+
+        // No store configured returns None.
+        assert!(resolve_lfs_pointer(&pointer, None).unwrap().is_none());
+
+        let lfs_root = dir.path().join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        // Short hash should return None.
+        fs::write(
+            &pointer,
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n",
+        )
+        .unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(&lfs_root))
+                .unwrap()
+                .is_none()
+        );
+
+        // Missing object should produce an error.
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let pointer_body = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12\n",
+            hash
+        );
+        fs::write(&pointer, pointer_body.clone()).unwrap();
+        let err = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap_err();
+        match err {
+            SyncError::MissingLfsObject { oid, .. } => assert_eq!(oid, hash),
+            other => panic!("unexpected error {other:?}"),
+        }
+
+        // Create the object so the pointer resolves successfully.
+        let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"real-content").unwrap();
+        let resolved = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap();
+        assert_eq!(resolved.unwrap(), object_path);
+
+        // Ensure additional lines without oid keep scanning.
+        let extra_pointer = dir.path().join("extra.pointer");
+        fs::write(
+            &extra_pointer,
+            format!(
+                "version https://git-lfs.github.com/spec/v1\ncomment ignored\noid sha256:{}\n",
+                hash
+            ),
+        )
+        .unwrap();
+        let resolved = resolve_lfs_pointer(&extra_pointer, Some(&lfs_root)).unwrap();
+        assert_eq!(resolved.unwrap(), object_path);
+    }
+
+    #[test]
+    fn apply_operations_patch_handles_base_delete_and_lfs() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let temp_checkout = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        // Prepare base commit with two files.
+        write_and_stage(&source_repo, Path::new("file.txt"), "old");
+        write_and_stage(&source_repo, Path::new("remove.txt"), "gone");
+        let base_sig = test_signature("Pat", 1_910_000_000);
+        let base_commit = commit(&source_repo, "base", &base_sig);
+
+        // Mirror base state into destination repository.
+        write_and_stage(&dest_repo, Path::new("file.txt"), "old");
+        write_and_stage(&dest_repo, Path::new("remove.txt"), "gone");
+        commit(&dest_repo, "base", &base_sig);
+
+        // Prepare new file contents in checkout directory.
+        let new_file_path = temp_checkout.path().join("file.txt");
+        fs::create_dir_all(new_file_path.parent().unwrap()).unwrap();
+        fs::write(&new_file_path, "new").unwrap();
+
+        let pointer_hash = "4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b";
+        let pointer_contents = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 5\n",
+            pointer_hash
+        );
+        let pointer_path = temp_checkout.path().join("pointer.dat");
+        fs::write(&pointer_path, &pointer_contents).unwrap();
+        let lfs_store = source_repo.path().join("lfs").join("objects");
+        fs::create_dir_all(&lfs_store).unwrap();
+        let pointer_object = lfs_store
+            .join(&pointer_hash[0..2])
+            .join(&pointer_hash[2..4])
+            .join(pointer_hash);
+        fs::create_dir_all(pointer_object.parent().unwrap()).unwrap();
+        fs::write(&pointer_object, b"lfs\n").unwrap();
+
+        // Build base entries from the base commit tree.
+        let base_tree = source_repo
+            .find_commit(base_commit)
+            .unwrap()
+            .tree()
+            .unwrap();
+        let file_entry = base_tree.get_path(Path::new("file.txt")).unwrap();
+        let delete_entry = base_tree.get_path(Path::new("remove.txt")).unwrap();
+
+        let operations = vec![
+            FileOp::Write {
+                source: new_file_path,
+                dest_relative: PathBuf::from("file.txt"),
+                filemode: 0o100644,
+                base: Some(BaseEntry {
+                    oid: file_entry.id(),
+                    filemode: file_entry.filemode() as u32,
+                }),
+            },
+            FileOp::Delete {
+                dest_relative: PathBuf::from("remove.txt"),
+                base: BaseEntry {
+                    oid: delete_entry.id(),
+                    filemode: delete_entry.filemode() as u32,
+                },
+            },
+            FileOp::Write {
+                source: pointer_path,
+                dest_relative: PathBuf::from("pointer.dat"),
+                filemode: 0o100644,
+                base: None,
+            },
+        ];
+
+        apply_operations_patch(&source_repo, &dest_repo, &operations).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("file.txt")).unwrap(),
+            "new"
+        );
+        assert!(!dest_dir.path().join("remove.txt").exists());
+        assert_eq!(
+            fs::read(dest_dir.path().join("pointer.dat")).unwrap(),
+            b"lfs\n"
+        );
+    }
+
+    #[test]
+    fn apply_operations_patch_no_changes_is_noop() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        apply_operations_patch(&source_repo, &dest_repo, &[]).unwrap();
+    }
+
+    #[test]
+    fn path_mapping_new_normalizes_inputs() {
+        let mapping =
+            PathMapping::new(PathBuf::from("./foo/./bar"), PathBuf::from("dest/.")).unwrap();
+        let applied = mapping.apply(Path::new("foo/bar/file.txt")).unwrap();
+        assert_eq!(applied, PathBuf::from("dest/file.txt"));
+    }
+
+    #[test]
+    fn path_mapping_from_str_works() {
+        let mapping: PathMapping = "src=dst".parse().unwrap();
+        assert!(mapping.apply(Path::new("src/name.txt")).is_some());
+    }
+
+    #[test]
+    fn sync_options_normalizes_skip_paths() {
+        let options = SyncOptions::new(
+            PathBuf::from("/tmp/source"),
+            PathBuf::from("/tmp/dest"),
+            Oid::zero(),
+            vec![],
+            vec![PathBuf::from("./skip/./dir")],
+        )
+        .unwrap();
+        assert_eq!(options.skip, vec![PathBuf::from("skip/dir")]);
+    }
+
+    #[test]
+    fn ensure_destination_clean_detects_changes_directly() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        fs::write(repo.workdir().unwrap().join("dirty.txt"), "dirty").unwrap();
+        let err = ensure_destination_clean(&repo).unwrap_err();
+        assert!(matches!(err, SyncError::DirtyDestination));
+    }
+
+    #[test]
+    fn checkout_to_temp_exports_tree() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let sig = test_signature("Checkout", 1_920_000_000);
+        write_and_stage(&repo, Path::new("file.txt"), "data");
+        let oid = commit(&repo, "commit", &sig);
+        let commit = repo.find_commit(oid).unwrap();
+        let temp = tempdir().unwrap();
+        checkout_to_temp(&repo, &commit, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("file.txt")).unwrap(),
+            "data"
+        );
+    }
+
+    #[test]
+    fn collect_operations_covers_multiple_statuses() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let sig = test_signature("Ops", 1_930_000_000);
+        write_and_stage(&repo, Path::new("delete.txt"), "one");
+        write_and_stage(&repo, Path::new("rename.txt"), "two");
+        write_and_stage(&repo, Path::new("modify.txt"), "three");
+        let base_oid = commit(&repo, "base", &sig);
+
+        let delete_path = repo.workdir().unwrap().join("delete.txt");
+        fs::remove_file(&delete_path).unwrap();
+        let rename_old = repo.workdir().unwrap().join("rename.txt");
+        let rename_new = repo.workdir().unwrap().join("renamed.txt");
+        std::fs::rename(&rename_old, &rename_new).unwrap();
+        fs::write(repo.workdir().unwrap().join("modify.txt"), "updated").unwrap();
+        fs::write(repo.workdir().unwrap().join("add.txt"), "added").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("delete.txt")).unwrap();
+        index.remove_path(Path::new("rename.txt")).unwrap();
+        index.add_path(Path::new("renamed.txt")).unwrap();
+        index.add_path(Path::new("modify.txt")).unwrap();
+        index.add_path(Path::new("add.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let new_tree = repo.find_tree(tree_id).unwrap();
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        let mut diff_opts = DiffOptions::new();
+        diff_opts.include_typechange(true);
+        diff_opts.include_typechange_trees(true);
+        let mut diff = repo
+            .diff_tree_to_tree(
+                Some(&base_commit.tree().unwrap()),
+                Some(&new_tree),
+                Some(&mut diff_opts),
+            )
+            .unwrap();
+        diff.find_similar(None).unwrap();
+
+        let options = SyncOptions::new(
+            dir.path().to_path_buf(),
+            tempdir().unwrap().path().to_path_buf(),
+            base_oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let operations = collect_operations(&diff, repo.workdir().unwrap(), &options).unwrap();
+        assert!(operations.iter().any(|op| matches!(
+            op,
+            FileOp::Delete { dest_relative, .. } if dest_relative == Path::new("delete.txt")
+        )));
+        assert!(operations.iter().any(|op| matches!(
+            op,
+            FileOp::Write { dest_relative, .. } if dest_relative == Path::new("renamed.txt")
+        )));
+        assert!(operations.iter().any(|op| matches!(
+            op,
+            FileOp::Write { dest_relative, .. } if dest_relative == Path::new("add.txt")
+        )));
+    }
+
+    #[test]
+    fn collect_operations_respects_skip_paths() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo(dir.path());
+        let sig = test_signature("Skip", 1_940_000_000);
+        write_and_stage(&repo, Path::new("delete.txt"), "one");
+        write_and_stage(&repo, Path::new("rename.txt"), "two");
+        write_and_stage(&repo, Path::new("modify.txt"), "three");
+        let base_oid = commit(&repo, "base", &sig);
+
+        let delete_path = repo.workdir().unwrap().join("delete.txt");
+        fs::remove_file(&delete_path).unwrap();
+        let rename_old = repo.workdir().unwrap().join("rename.txt");
+        let rename_new = repo.workdir().unwrap().join("renamed.txt");
+        std::fs::rename(&rename_old, &rename_new).unwrap();
+        fs::write(repo.workdir().unwrap().join("modify.txt"), "updated").unwrap();
+        fs::write(repo.workdir().unwrap().join("add.txt"), "added").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new("delete.txt")).unwrap();
+        index.remove_path(Path::new("rename.txt")).unwrap();
+        index.add_path(Path::new("renamed.txt")).unwrap();
+        index.add_path(Path::new("modify.txt")).unwrap();
+        index.add_path(Path::new("add.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let new_tree = repo.find_tree(tree_id).unwrap();
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        let mut diff_opts = DiffOptions::new();
+        diff_opts.include_typechange(true);
+        diff_opts.include_typechange_trees(true);
+        let mut diff = repo
+            .diff_tree_to_tree(
+                Some(&base_commit.tree().unwrap()),
+                Some(&new_tree),
+                Some(&mut diff_opts),
+            )
+            .unwrap();
+        diff.find_similar(None).unwrap();
+
+        let options = SyncOptions::new(
+            dir.path().to_path_buf(),
+            tempdir().unwrap().path().to_path_buf(),
+            base_oid,
+            vec![],
+            vec![
+                PathBuf::from("delete.txt"),
+                PathBuf::from("renamed.txt"),
+                PathBuf::from("modify.txt"),
+                PathBuf::from("add.txt"),
+            ],
+        )
+        .unwrap();
+
+        let operations = collect_operations(&diff, repo.workdir().unwrap(), &options).unwrap();
+        assert!(operations.is_empty());
+    }
+
+    #[test]
+    fn apply_operations_copy_handles_lfs_and_delete() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        let regular_src = source_dir.path().join("regular.txt");
+        fs::write(&regular_src, "regular").unwrap();
+
+        let hash = "5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c";
+        let pointer_src = source_dir.path().join("pointer.dat");
+        fs::write(
+            &pointer_src,
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 6\n",
+                hash
+            ),
+        )
+        .unwrap();
+        let lfs_store = source_repo.path().join("lfs").join("objects");
+        fs::create_dir_all(&lfs_store).unwrap();
+        let object_path = lfs_store.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"object").unwrap();
+
+        let dest_remove = dest_repo.workdir().unwrap().join("remove.txt");
+        fs::write(&dest_remove, "remove").unwrap();
+
+        let operations = vec![
+            FileOp::Write {
+                source: regular_src,
+                dest_relative: PathBuf::from("regular.txt"),
+                filemode: 0o100644,
+                base: None,
+            },
+            FileOp::Write {
+                source: pointer_src,
+                dest_relative: PathBuf::from("pointer.dat"),
+                filemode: 0o100755,
+                base: None,
+            },
+            FileOp::Delete {
+                dest_relative: PathBuf::from("remove.txt"),
+                base: BaseEntry {
+                    oid: Oid::zero(),
+                    filemode: 0o100644,
+                },
+            },
+        ];
+
+        apply_operations_copy(&source_repo, &dest_repo, &operations).unwrap();
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("regular.txt")).unwrap(),
+            "regular"
+        );
+        assert_eq!(
+            fs::read(dest_dir.path().join("pointer.dat")).unwrap(),
+            b"object"
+        );
+        assert!(!dest_dir.path().join("remove.txt").exists());
+    }
+
+    #[test]
+    fn copy_entry_errors_when_lfs_missing() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        let lfs_root = dir.path().join("lfs").join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+        let hash = "abcde12345abcde12345abcde12345abcde12345abcde12345abcde12345abcd";
+        fs::write(
+            &pointer,
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 4\n",
+                hash
+            ),
+        )
+        .unwrap();
+        let err = copy_entry(
+            &pointer,
+            &dir.path().join("dest"),
+            0o100644,
+            Some(&lfs_root),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SyncError::MissingLfsObject { .. }));
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_handles_invalid_data() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("invalid.pointer");
+        fs::write(&pointer, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pointer_two = dir.path().join("invalid_loop.pointer");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"version https://git-lfs.github.com/spec/v1\n");
+        data.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+        fs::write(&pointer_two, data).unwrap();
+        let store = dir.path().join("objects");
+        fs::create_dir_all(&store).unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer_two, Some(&store))
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(
+            &pointer_two,
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\n",
+                &hash[0..10]
+            ),
+        )
+        .unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer_two, Some(&store))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_reports_io_error_for_missing_file() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing.pointer");
+        let err = resolve_lfs_pointer(&missing, Some(dir.path()))
+            .expect_err("expected io error for missing pointer");
+        assert!(matches!(err, SyncError::Io { .. }));
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_handles_completely_empty_file() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("empty.pointer");
+        fs::File::create(&pointer).unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_returns_none_for_empty_file() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("empty.pointer");
+        fs::write(&pointer, "version https://git-lfs.github.com/spec/v1").unwrap();
+        let store = dir.path().join("objects");
+        fs::create_dir_all(&store).unwrap();
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(&store))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_entry_for_patch_reports_error() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing.txt");
+        let err = read_entry_for_patch(&missing, 0o100644).unwrap_err();
+        match err {
+            SyncError::Io { path, .. } => assert_eq!(path, missing),
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_destination_prefers_longest_prefix() {
+        let mappings = vec![
+            PathMapping::parse("a=b").unwrap(),
+            PathMapping::parse("a/b=c").unwrap(),
+        ];
+        let mapped = map_destination(Path::new("a/b/file.txt"), &mappings);
+        assert_eq!(mapped, PathBuf::from("c/file.txt"));
+    }
+
+    #[test]
+    fn sync_commit_honors_signature_overrides() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        let sig = test_signature("Orig", 1_940_000_000);
+        write_and_stage(&source_repo, Path::new("file.txt"), "data");
+        let commit_oid = commit(&source_repo, "commit", &sig);
+
+        let mut options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            commit_oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        options.author_name = Some("Override".to_string());
+        options.author_email = Some("override@example.com".to_string());
+        options.committer_name = Some("Committer".to_string());
+        options.committer_email = Some("committer@example.com".to_string());
+
+        let new_oid = sync_commit(options).unwrap();
+        let commit = dest_repo.find_commit(new_oid).unwrap();
+        assert_eq!(commit.author().name().unwrap(), "Override");
+        assert_eq!(commit.committer().name().unwrap(), "Committer");
     }
 }
