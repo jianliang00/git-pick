@@ -1,9 +1,9 @@
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use git2::Oid;
 
-use git_pick::{PathMapping, SyncError, SyncOptions, sync_commit};
+use git_pick::{PathMapping, SyncError, SyncMode, SyncOptions, sync_commit};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,6 +47,16 @@ struct Args {
     /// Override the committer email of the reproduced commit
     #[arg(long, value_name = "EMAIL")]
     committer_email: Option<String>,
+
+    /// Synchronization mode used to apply changes to the destination
+    #[arg(long, value_name = "MODE", value_enum, default_value_t = Mode::Patch)]
+    mode: Mode,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Mode {
+    Patch,
+    Copy,
 }
 
 fn main() {
@@ -68,6 +78,10 @@ fn run() -> Result<(), SyncError> {
     options.author_email = args.author_email;
     options.committer_name = args.committer_name;
     options.committer_email = args.committer_email;
+    options.mode = match args.mode {
+        Mode::Patch => SyncMode::Patch,
+        Mode::Copy => SyncMode::Copy,
+    };
 
     sync_commit(options).map(|_| ())
 }
