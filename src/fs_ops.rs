@@ -12,6 +12,7 @@ fn io_error(path: &Path, source: std::io::Error) -> SyncError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_entry_for_patch(path: &Path, filemode: u32) -> Result<Vec<u8>, SyncError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| io_error(path, err))?;
     if metadata.file_type().is_symlink() || filemode == 0o120000 {
@@ -22,6 +23,7 @@ pub(crate) fn read_entry_for_patch(path: &Path, filemode: u32) -> Result<Vec<u8>
     }
 }
 
+#[cfg(test)]
 pub(crate) fn os_str_to_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {

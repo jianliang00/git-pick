@@ -2,8 +2,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use git2::{
-    ApplyLocation, ApplyOptions, DiffOptions, ErrorCode, Index, IndexEntry, IndexTime, Oid,
-    Repository, Signature, StatusOptions, build::CheckoutBuilder,
+    DiffOptions, ErrorCode, Oid, Repository, Signature, StatusOptions, build::CheckoutBuilder,
 };
 use thiserror::Error;
 
@@ -539,8 +538,19 @@ fn apply_operations_patch(
     } else {
         None
     };
-    let mut base_index = Index::new()?;
-    let mut target_index = Index::new()?;
+
+    let head_commit = match dest_repo.head() {
+        Ok(head) => Some(head.peel_to_commit()?),
+        Err(err) if err.code() == ErrorCode::UnbornBranch => None,
+        Err(err) => return Err(err.into()),
+    };
+    let head_tree = if let Some(commit) = head_commit.as_ref() {
+        Some(commit.tree()?)
+    } else {
+        None
+    };
+
+    let mut index = dest_repo.index()?;
     let mut lfs_materializations = Vec::new();
 
     for operation in operations {
@@ -552,22 +562,32 @@ fn apply_operations_patch(
                 base,
             } => {
                 if let Some(base_entry) = base {
-                    let base_blob = source_repo.find_blob(base_entry.oid)?;
-                    let base_data = base_blob.content();
-                    let base_oid = dest_repo.blob(base_data)?;
-                    let entry = make_index_entry(
-                        dest_relative,
-                        base_oid,
-                        base_entry.filemode,
-                        base_data.len(),
-                    );
-                    base_index.add(&entry)?;
+                    let _ = base_entry.filemode;
+                    if let Some(tree) = head_tree.as_ref() {
+                        if let Ok(existing) = tree.get_path(dest_relative) {
+                            if existing.id() != base_entry.oid {
+                                return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                            }
+                        } else {
+                            return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                        }
+                    } else {
+                        return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                    }
+                } else if let Some(tree) = head_tree.as_ref() {
+                    if tree.get_path(dest_relative).is_ok() {
+                        return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                    }
                 }
-                let data = fs_ops::read_entry_for_patch(source, *filemode)?;
-                let blob = dest_repo.blob(&data)?;
-                let entry = make_index_entry(dest_relative, blob, *filemode, data.len());
-                target_index.add(&entry)?;
-                if let Some(object) = fs_ops::resolve_lfs_pointer(source, lfs_store.as_deref())? {
+
+                let dest_path = workdir.join(dest_relative);
+                if let Some(parent) = dest_path.parent() {
+                    fs_ops::create_dir_all(parent)?;
+                }
+                let lfs_object =
+                    fs_ops::copy_entry(source, &dest_path, *filemode, lfs_store.as_deref())?;
+                index.add_path(dest_relative)?;
+                if let Some(object) = lfs_object {
                     lfs_materializations.push(LfsMaterialization {
                         dest_relative: dest_relative.clone(),
                         object,
@@ -575,30 +595,33 @@ fn apply_operations_patch(
                     });
                 }
             }
-            FileOp::Delete {
-                dest_relative,
-                base,
-            } => {
-                let base_blob = source_repo.find_blob(base.oid)?;
-                let base_data = base_blob.content();
-                let base_oid = dest_repo.blob(base_data)?;
-                let entry =
-                    make_index_entry(dest_relative, base_oid, base.filemode, base_data.len());
-                base_index.add(&entry)?;
+            FileOp::Delete { dest_relative, base } => {
+                if let Some(tree) = head_tree.as_ref() {
+                    if let Ok(existing) = tree.get_path(dest_relative) {
+                        if existing.id() != base.oid {
+                            return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                        }
+                    } else {
+                        return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                    }
+                } else {
+                    return Err(git2::Error::from_str("conflicted delta is not supported").into());
+                }
+
+                let dest_path = workdir.join(dest_relative);
+                if let Ok(metadata) = std::fs::symlink_metadata(&dest_path) {
+                    if metadata.file_type().is_dir() {
+                        fs_ops::remove_dir_all(&dest_path)?;
+                    } else {
+                        fs_ops::remove_file(&dest_path)?;
+                    }
+                }
+                index.remove_path(dest_relative)?;
             }
         }
     }
 
-    let mut diff_opts = DiffOptions::new();
-    diff_opts.include_typechange(true);
-    diff_opts.include_typechange_trees(true);
-    let diff = dest_repo.diff_index_to_index(&base_index, &target_index, Some(&mut diff_opts))?;
-    if diff.deltas().len() == 0 {
-        return Ok(());
-    }
-
-    let mut apply_opts = ApplyOptions::new();
-    dest_repo.apply(&diff, ApplyLocation::Both, Some(&mut apply_opts))?;
+    index.write()?;
 
     for materialization in lfs_materializations {
         let dest_path = workdir.join(&materialization.dest_relative);
@@ -618,29 +641,13 @@ struct LfsMaterialization {
     filemode: u32,
 }
 
-fn make_index_entry(path: &Path, blob: Oid, filemode: u32, size: usize) -> IndexEntry {
-    let path_bytes = path_to_repo_bytes(path);
-    IndexEntry {
-        ctime: IndexTime::new(0, 0),
-        mtime: IndexTime::new(0, 0),
-        dev: 0,
-        ino: 0,
-        mode: filemode,
-        uid: 0,
-        gid: 0,
-        file_size: (size.min(u32::MAX as usize)) as u32,
-        id: blob,
-        flags: index_flags_for_len(path_bytes.len()),
-        flags_extended: 0,
-        path: path_bytes,
-    }
-}
-
+#[cfg(test)]
 fn index_flags_for_len(len: usize) -> u16 {
     let capped = len.min(0x0FFF);
     capped as u16
 }
 
+#[cfg(test)]
 fn path_to_repo_bytes(path: &Path) -> Vec<u8> {
     if path.as_os_str().is_empty() {
         return Vec::new();
@@ -705,6 +712,88 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn sync_binary_add_patch_mode() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("BinAdd", 1_920_000_000);
+
+        let rel = Path::new("bin.dat");
+        let full = source_repo.workdir().unwrap().join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let bytes = vec![0u8, 1, 2, 255, 128, 64, 10, 20, 30];
+        fs::write(&full, &bytes).unwrap();
+        let mut index = source_repo.index().unwrap();
+        index.add_path(rel).unwrap();
+        index.write().unwrap();
+        let oid = commit(&source_repo, "bin-add", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(options).unwrap();
+
+        let dest_bytes = fs::read(dest_dir.path().join(rel)).unwrap();
+        assert_eq!(dest_bytes, bytes);
+    }
+
+    #[test]
+    fn sync_binary_modify_patch_mode() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("BinMod", 1_930_000_000);
+
+        let rel = Path::new("bin2.dat");
+        let full = source_repo.workdir().unwrap().join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        let v1 = vec![1u8, 3, 5, 7, 9, 11, 13];
+        fs::write(&full, &v1).unwrap();
+        let mut index = source_repo.index().unwrap();
+        index.add_path(rel).unwrap();
+        index.write().unwrap();
+        let base = commit(&source_repo, "bin-base", &sig);
+
+        let options_base = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            base,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(options_base).unwrap();
+
+        let v2 = vec![2u8, 4, 6, 8, 10, 12, 14, 0];
+        fs::write(&full, &v2).unwrap();
+        let mut index2 = source_repo.index().unwrap();
+        index2.add_path(rel).unwrap();
+        index2.write().unwrap();
+        let update = commit(&source_repo, "bin-update", &sig);
+
+        let options_update = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            update,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(options_update).unwrap();
+
+        let dest_bytes = fs::read(dest_dir.path().join(rel)).unwrap();
+        assert_eq!(dest_bytes, v2);
+    }
     #[test]
     fn mapping_parse_and_apply() {
         let mapping = PathMapping::parse("aaa/bbb=ccc").unwrap();
@@ -1449,8 +1538,7 @@ mod tests {
         fs::create_dir_all(&lfs_root).unwrap();
         let hash = "9d0b5e1423f8a0a2f4f2b8d74d07d377c6e6f4c4f8b4f6a8d0c2e4b6a0c8d2e4";
         let pointer = format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 4\n",
-            hash
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize 4\n"
         );
         let pointer_src = src_dir.join("pointer.bin");
         fs::write(&pointer_src, pointer).unwrap();
@@ -1526,8 +1614,7 @@ mod tests {
         // Missing object should produce an error.
         let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
         let pointer_body = format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12\n",
-            hash
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize 12\n"
         );
         fs::write(&pointer, pointer_body.clone()).unwrap();
         let err = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap_err();
@@ -1548,8 +1635,7 @@ mod tests {
         fs::write(
             &extra_pointer,
             format!(
-                "version https://git-lfs.github.com/spec/v1\ncomment ignored\noid sha256:{}\n",
-                hash
+                "version https://git-lfs.github.com/spec/v1\ncomment ignored\noid sha256:{hash}\n"
             ),
         )
         .unwrap();
@@ -1583,8 +1669,7 @@ mod tests {
 
         let pointer_hash = "4b5c6d7e8f9012a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b";
         let pointer_contents = format!(
-            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 5\n",
-            pointer_hash
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{pointer_hash}\nsize 5\n"
         );
         let pointer_path = temp_checkout.path().join("pointer.dat");
         fs::write(&pointer_path, &pointer_contents).unwrap();
@@ -1843,8 +1928,7 @@ mod tests {
         fs::write(
             &pointer_src,
             format!(
-                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 6\n",
-                hash
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize 6\n"
             ),
         )
         .unwrap();
@@ -1901,8 +1985,7 @@ mod tests {
         fs::write(
             &pointer,
             format!(
-                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 4\n",
-                hash
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\nsize 4\n"
             ),
         )
         .unwrap();
