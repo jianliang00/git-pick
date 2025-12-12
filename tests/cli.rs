@@ -176,3 +176,178 @@ fn cli_rejects_invalid_commit() {
         .failure()
         .stderr(predicates::str::contains("failed to parse commit"));
 }
+
+#[test]
+fn cli_syncs_commit_chain_with_all_flag() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    let dest_repo = init_repo(dest_dir.path());
+
+    // Create a chain of commits in the source repo
+    write_and_stage(&source_repo, Path::new("file1.txt"), "content1");
+    let _commit1 = commit(&source_repo, "commit 1");
+
+    write_and_stage(&source_repo, Path::new("file2.txt"), "content2");
+    let _commit2 = commit(&source_repo, "commit 2");
+
+    write_and_stage(&source_repo, Path::new("file3.txt"), "content3");
+    let commit3 = commit(&source_repo, "commit 3");
+
+    // Use --all flag to sync all three commits
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &commit3,
+            "--all",
+        ])
+        .assert()
+        .success();
+
+    // Verify all three files were synced
+    assert!(dest_dir.path().join("file1.txt").exists());
+    assert!(dest_dir.path().join("file2.txt").exists());
+    assert!(dest_dir.path().join("file3.txt").exists());
+
+    // Verify we have 3 commits in destination
+    let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.summary().unwrap(), "commit 3");
+    let parent1 = head.parent(0).unwrap();
+    assert_eq!(parent1.summary().unwrap(), "commit 2");
+    let parent2 = parent1.parent(0).unwrap();
+    assert_eq!(parent2.summary().unwrap(), "commit 1");
+}
+
+#[test]
+fn cli_all_flag_stops_at_empty_diff() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    let dest_repo = init_repo(dest_dir.path());
+
+    // Create initial commit in source
+    write_and_stage(&source_repo, Path::new("file1.txt"), "content1");
+    let commit1 = commit(&source_repo, "base commit");
+
+    // Sync the first commit manually to destination using copy mode
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &commit1,
+            "--mode",
+            "copy",
+        ])
+        .assert()
+        .success();
+
+    // Add more commits in source
+    write_and_stage(&source_repo, Path::new("file2.txt"), "content2");
+    let _commit2 = commit(&source_repo, "new commit 1");
+
+    write_and_stage(&source_repo, Path::new("file3.txt"), "content3");
+    let commit3 = commit(&source_repo, "new commit 2");
+
+    // Use --all flag - should sync only the new commits
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &commit3,
+            "--all",
+            "--mode",
+            "copy",
+        ])
+        .assert()
+        .success();
+
+    // Verify the new files were synced
+    assert!(dest_dir.path().join("file2.txt").exists());
+    assert!(dest_dir.path().join("file3.txt").exists());
+
+    // Verify we have 3 commits total in destination
+    let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.summary().unwrap(), "new commit 2");
+}
+
+#[test]
+fn cli_all_flag_with_skip_produces_empty_diff() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    init_repo(dest_dir.path());
+
+    // Create commits that will be skipped
+    write_and_stage(&source_repo, Path::new("skip/file1.txt"), "content1");
+    let _commit1 = commit(&source_repo, "skipped commit");
+
+    // Create a non-skipped commit
+    write_and_stage(&source_repo, Path::new("keep/file2.txt"), "content2");
+    let commit2 = commit(&source_repo, "kept commit");
+
+    // Use --all with --skip flag
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &commit2,
+            "--all",
+            "--skip",
+            "skip",
+        ])
+        .assert()
+        .success();
+
+    // Verify only the non-skipped file was synced
+    assert!(!dest_dir.path().join("skip/file1.txt").exists());
+    assert!(dest_dir.path().join("keep/file2.txt").exists());
+}
+
+#[test]
+fn cli_all_flag_when_specified_commit_is_empty() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    init_repo(dest_dir.path());
+
+    // Create a commit with only skipped files
+    write_and_stage(&source_repo, Path::new("skip/file.txt"), "content");
+    let commit1 = commit(&source_repo, "skipped");
+
+    // Use --all flag with skip - the commit produces empty diff
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &commit1,
+            "--all",
+            "--skip",
+            "skip",
+        ])
+        .assert()
+        .success();
+
+    // Verify no files were synced
+    assert!(!dest_dir.path().join("skip/file.txt").exists());
+}

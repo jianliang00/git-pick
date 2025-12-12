@@ -216,6 +216,118 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
         });
     }
 
+    sync_single_commit(&source_repo, &dest_repo, &commit, &options)
+}
+
+pub fn sync_commit_chain(options: SyncOptions) -> Result<Oid, SyncError> {
+    let source_repo =
+        Repository::open(&options.source_repo).map_err(|source| SyncError::SourceOpen {
+            path: options.source_repo.clone(),
+            source,
+        })?;
+    let dest_repo = Repository::open(&options.dest_repo).map_err(|source| SyncError::DestOpen {
+        path: options.dest_repo.clone(),
+        source,
+    })?;
+
+    if dest_repo.is_bare() {
+        return Err(SyncError::BareDestination);
+    }
+
+    ensure_destination_clean(&dest_repo)?;
+
+    // Collect commits to sync, walking backwards from the specified commit
+    let mut commits_to_sync = Vec::new();
+    let mut current_oid = options.commit;
+
+    loop {
+        let commit = source_repo
+            .find_commit(current_oid)
+            .map_err(|source| SyncError::CommitLookup {
+                commit: current_oid.to_string(),
+                source,
+            })?;
+
+        if commit.parent_count() > 1 {
+            return Err(SyncError::MergeCommit {
+                commit: current_oid.to_string(),
+            });
+        }
+
+        // Check if this commit would produce an empty diff
+        let would_sync = !is_empty_diff(&source_repo, &commit, &options)?;
+
+        if !would_sync {
+            // Stop at the first commit that produces empty diff
+            break;
+        }
+
+        commits_to_sync.push(current_oid);
+
+        // Move to parent
+        if commit.parent_count() == 0 {
+            break;
+        }
+
+        current_oid = commit.parent(0)?.id();
+    }
+
+    // Reverse to sync oldest first
+    commits_to_sync.reverse();
+
+    if commits_to_sync.is_empty() {
+        // Nothing to sync - the specified commit itself produces empty diff
+        return Ok(options.commit);
+    }
+
+    // Sync each commit in order
+    let mut last_oid = Oid::zero();
+    for commit_oid in commits_to_sync {
+        let commit = source_repo.find_commit(commit_oid)?;
+        let synced_oid = sync_single_commit(&source_repo, &dest_repo, &commit, &options)?;
+        last_oid = synced_oid;
+    }
+
+    Ok(last_oid)
+}
+
+fn is_empty_diff(
+    source_repo: &Repository,
+    commit: &git2::Commit,
+    options: &SyncOptions,
+) -> Result<bool, SyncError> {
+    let commit_tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() == 1 {
+        commit.parent(0)?.tree()?
+    } else {
+        let empty_tree_id = source_repo.treebuilder(None)?.write()?;
+        source_repo.find_tree(empty_tree_id)?
+    };
+
+    let temp_dir = fs_ops::create_temp_dir_for(&options.source_repo)?;
+    checkout_to_temp(source_repo, commit, temp_dir.path())?;
+
+    let mut diff_options = DiffOptions::new();
+    diff_options.include_typechange(true);
+    diff_options.include_typechange_trees(true);
+    let mut diff = source_repo.diff_tree_to_tree(
+        Some(&parent_tree),
+        Some(&commit_tree),
+        Some(&mut diff_options),
+    )?;
+    diff.find_similar(None)?;
+
+    let operations = collect_operations(&diff, temp_dir.path(), options)?;
+    Ok(operations.is_empty())
+}
+
+fn sync_single_commit(
+    source_repo: &Repository,
+    dest_repo: &Repository,
+    commit: &git2::Commit,
+    options: &SyncOptions,
+) -> Result<Oid, SyncError> {
+
     let commit_tree = commit.tree()?;
     let parent_tree = if commit.parent_count() == 1 {
         commit.parent(0)?.tree()?
@@ -2123,5 +2235,180 @@ mod tests {
         let commit = dest_repo.find_commit(new_oid).unwrap();
         assert_eq!(commit.author().name().unwrap(), "Override");
         assert_eq!(commit.committer().name().unwrap(), "Committer");
+    }
+
+    #[test]
+    fn sync_commit_chain_syncs_multiple_commits() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("Chain", 2_000_000_000);
+
+        // Create a chain of commits
+        write_and_stage(&source_repo, Path::new("file1.txt"), "first");
+        let _commit1 = commit(&source_repo, "first", &sig);
+
+        write_and_stage(&source_repo, Path::new("file2.txt"), "second");
+        let _commit2 = commit(&source_repo, "second", &sig);
+
+        write_and_stage(&source_repo, Path::new("file3.txt"), "third");
+        let commit3 = commit(&source_repo, "third", &sig);
+
+        // Sync all three using sync_commit_chain
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            commit3,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let last_oid = sync_commit_chain(options).unwrap();
+
+        // Verify all files exist
+        assert!(dest_dir.path().join("file1.txt").exists());
+        assert!(dest_dir.path().join("file2.txt").exists());
+        assert!(dest_dir.path().join("file3.txt").exists());
+
+        // Verify commit chain
+        let head = dest_repo.find_commit(last_oid).unwrap();
+        assert_eq!(head.summary().unwrap(), "third");
+        let parent1 = head.parent(0).unwrap();
+        assert_eq!(parent1.summary().unwrap(), "second");
+        let parent2 = parent1.parent(0).unwrap();
+        assert_eq!(parent2.summary().unwrap(), "first");
+    }
+
+    #[test]
+    fn sync_commit_chain_stops_at_empty_diff() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("StopChain", 2_010_000_000);
+
+        // Create and sync first commit
+        write_and_stage(&source_repo, Path::new("base.txt"), "base");
+        let base_commit = commit(&source_repo, "base", &sig);
+
+        let mut options_base = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            base_commit,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        options_base.mode = SyncMode::Copy; // Use copy mode to avoid conflicts
+        sync_commit(options_base).unwrap();
+
+        // Create more commits
+        write_and_stage(&source_repo, Path::new("new1.txt"), "new1");
+        let _new_commit1 = commit(&source_repo, "new1", &sig);
+
+        write_and_stage(&source_repo, Path::new("new2.txt"), "new2");
+        let new_commit2 = commit(&source_repo, "new2", &sig);
+
+        // Sync with chain - should only sync new commits
+        let mut options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            new_commit2,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        options.mode = SyncMode::Copy; // Use copy mode to avoid conflicts
+
+        sync_commit_chain(options).unwrap();
+
+        // Verify new files exist
+        assert!(dest_dir.path().join("new1.txt").exists());
+        assert!(dest_dir.path().join("new2.txt").exists());
+
+        // Count commits - should be 3 total (base + 2 new)
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "new2");
+        let parent1 = head.parent(0).unwrap();
+        assert_eq!(parent1.summary().unwrap(), "new1");
+        let parent2 = parent1.parent(0).unwrap();
+        assert_eq!(parent2.summary().unwrap(), "base");
+    }
+
+    #[test]
+    fn sync_commit_chain_handles_empty_commit() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+        let sig = test_signature("EmptyChain", 2_020_000_000);
+
+        // Create commit with skipped content
+        write_and_stage(&source_repo, Path::new("skip/file.txt"), "skipped");
+        let skipped_commit = commit(&source_repo, "skipped", &sig);
+
+        // Try to sync with --all equivalent
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            skipped_commit,
+            vec![],
+            vec![PathBuf::from("skip")],
+        )
+        .unwrap();
+
+        let result = sync_commit_chain(options).unwrap();
+
+        // Should return the commit OID but not create any actual commit
+        assert_eq!(result, skipped_commit);
+
+        // Verify no files were synced
+        assert!(!dest_dir.path().join("skip/file.txt").exists());
+    }
+
+    #[test]
+    fn sync_commit_chain_with_mapping() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("MapChain", 2_030_000_000);
+
+        // Create commits with mapped paths
+        write_and_stage(&source_repo, Path::new("src/file1.txt"), "first");
+        let _commit1 = commit(&source_repo, "first", &sig);
+
+        write_and_stage(&source_repo, Path::new("src/file2.txt"), "second");
+        let commit2 = commit(&source_repo, "second", &sig);
+
+        let mapping = PathMapping::parse("src=dest").unwrap();
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            commit2,
+            vec![mapping],
+            vec![],
+        )
+        .unwrap();
+
+        sync_commit_chain(options).unwrap();
+
+        // Verify files were mapped correctly
+        assert!(dest_dir.path().join("dest/file1.txt").exists());
+        assert!(dest_dir.path().join("dest/file2.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("dest/file1.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("dest/file2.txt")).unwrap(),
+            "second"
+        );
+
+        // Verify commit chain
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary().unwrap(), "second");
     }
 }

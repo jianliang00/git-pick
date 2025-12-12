@@ -3,7 +3,7 @@ use std::process;
 use clap::{Parser, ValueEnum};
 use git2::Oid;
 
-use git_pick::{PathMapping, SyncError, SyncMode, SyncOptions, sync_commit};
+use git_pick::{PathMapping, SyncError, SyncMode, SyncOptions, sync_commit, sync_commit_chain};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,6 +51,10 @@ struct Args {
     /// Synchronization mode used to apply changes to the destination
     #[arg(long, value_name = "MODE", value_enum, default_value_t = Mode::Patch)]
     mode: Mode,
+
+    /// Pick all unpicked commits from the specified commit and its ancestors
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -68,8 +72,16 @@ fn main() {
 
 fn run() -> Result<(), SyncError> {
     let args = Args::parse();
+    let all = args.all;
     let options = build_options(args)?;
-    sync_commit(options).map(|_| ())
+    
+    if all {
+        let oid = sync_commit_chain(options)?;
+        println!("Synced commits up to {}", oid);
+    } else {
+        sync_commit(options).map(|_| ())?;
+    }
+    Ok(())
 }
 
 fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
@@ -84,6 +96,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         committer_name,
         committer_email,
         mode,
+        all: _,  // consumed before this function is called
     } = args;
 
     let oid = Oid::from_str(&commit).map_err(|source| SyncError::InvalidCommitId {
