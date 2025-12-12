@@ -281,7 +281,7 @@ pub fn sync_commit_chain(options: SyncOptions) -> Result<Oid, SyncError> {
     }
 
     // Sync each commit in order
-    let mut last_oid = Oid::zero();
+    let mut last_oid = commits_to_sync[0]; // Safe since we checked for empty above
     for commit_oid in commits_to_sync {
         let commit = source_repo.find_commit(commit_oid)?;
         let synced_oid = sync_single_commit(&source_repo, &dest_repo, &commit, &options)?;

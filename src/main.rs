@@ -96,7 +96,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         committer_name,
         committer_email,
         mode,
-        all: _,  // consumed before this function is called
+        all: _, // consumed in run() before this function is called
     } = args;
 
     let oid = Oid::from_str(&commit).map_err(|source| SyncError::InvalidCommitId {
