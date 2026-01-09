@@ -51,6 +51,10 @@ struct Args {
     /// Synchronization mode used to apply changes to the destination
     #[arg(long, value_name = "MODE", value_enum, default_value_t = Mode::Patch)]
     mode: Mode,
+
+    /// Allow already-synchronized commits without treating them as errors
+    #[arg(long)]
+    allow_empty: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -84,6 +88,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         committer_name,
         committer_email,
         mode,
+        allow_empty,
     } = args;
 
     let oid = Oid::from_str(&commit).map_err(|source| SyncError::InvalidCommitId {
@@ -100,6 +105,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         Mode::Patch => SyncMode::Patch,
         Mode::Copy => SyncMode::Copy,
     };
+    options.allow_empty = allow_empty;
 
     Ok(options)
 }
@@ -131,6 +137,7 @@ mod tests {
         assert_eq!(options.mode, SyncMode::Patch);
         assert!(options.author_name.is_none());
         assert!(options.committer_email.is_none());
+        assert!(!options.allow_empty);
     }
 
     #[test]
@@ -153,6 +160,7 @@ mod tests {
             "Committer",
             "--committer-email",
             "committer@example.com",
+            "--allow-empty",
         ]);
         let options = build_options(args).unwrap();
         assert_eq!(options.mode, SyncMode::Copy);
@@ -163,6 +171,7 @@ mod tests {
             options.committer_email.as_deref(),
             Some("committer@example.com")
         );
+        assert!(options.allow_empty);
     }
 
     #[test]

@@ -59,6 +59,7 @@ git-pick --source <PATH> --dest <PATH> --commit <OID> [--map <SRC=DEST> ...] [--
 - `--skip` – optional paths that should be ignored during synchronisation.
 - `--author-name` / `--author-email` – optional overrides for the author information of the replayed commit.
 - `--committer-name` / `--committer-email` – optional overrides for the committer information of the replayed commit.
+- `--allow-empty` – treat already-synchronised commits as warnings instead of errors.
 
 ### Example
 
