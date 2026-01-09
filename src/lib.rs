@@ -1097,6 +1097,92 @@ mod tests {
     }
 
     #[test]
+    fn operations_already_applied_returns_false_when_dest_missing() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("file.txt");
+        fs::write(&source_path, "content").unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("missing.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[test]
+    fn operations_already_applied_returns_false_for_directory_dest() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("file.txt");
+        fs::write(&source_path, "content").unwrap();
+        fs::create_dir_all(dest_dir.path().join("file.txt")).unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[test]
+    fn operations_already_applied_returns_false_for_symlink_mismatch() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("link.txt");
+        fs::write(&source_path, "content").unwrap();
+        fs::write(dest_dir.path().join("link.txt"), "content").unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("link.txt"),
+            filemode: 0o120000,
+            base: None,
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operations_already_applied_returns_false_for_exec_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("file.txt");
+        fs::write(&source_path, "content").unwrap();
+        let dest_path = dest_dir.path().join("file.txt");
+        fs::write(&dest_path, "content").unwrap();
+        let mut permissions = fs::metadata(&dest_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest_path, permissions).unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[test]
     fn sync_with_mapping() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
