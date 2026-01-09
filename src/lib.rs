@@ -683,12 +683,10 @@ fn apply_operations_patch(
                             git2::Error::from_str("conflicted delta is not supported").into()
                         );
                     }
-                } else if let Some(tree) = head_tree.as_ref() {
-                    if tree.get_path(dest_relative).is_ok() {
-                        return Err(
-                            git2::Error::from_str("conflicted delta is not supported").into()
-                        );
-                    }
+                } else if let Some(tree) = head_tree.as_ref()
+                    && tree.get_path(dest_relative).is_ok()
+                {
+                    return Err(git2::Error::from_str("conflicted delta is not supported").into());
                 }
 
                 let dest_path = workdir.join(dest_relative);
