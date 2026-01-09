@@ -545,9 +545,13 @@ fn operations_already_applied(
                         return Ok(false);
                     }
                 }
-                let expected_path = match fs_ops::resolve_lfs_pointer(source, lfs_store)? {
-                    Some(object) => object,
-                    None => source.clone(),
+                let expected_path = if *filemode == 0o120000 {
+                    source.clone()
+                } else {
+                    match fs_ops::resolve_lfs_pointer(source, lfs_store)? {
+                        Some(object) => object,
+                        None => source.clone(),
+                    }
                 };
                 let expected_bytes = fs_ops::read_entry_bytes(&expected_path, *filemode)?;
                 let dest_bytes = fs_ops::read_entry_bytes(&dest_path, *filemode)?;
