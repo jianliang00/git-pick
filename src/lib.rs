@@ -786,7 +786,7 @@ mod tests {
         remove_dir_all, remove_file, resolve_lfs_pointer, set_executable_if_needed,
     };
     use super::*;
-    use git2::{RepositoryInitOptions, Signature, Time};
+    use git2::{Oid, RepositoryInitOptions, Signature, Time};
     use tempfile::tempdir;
 
     fn init_repo(path: &Path) -> Repository {
@@ -1045,6 +1045,55 @@ mod tests {
         let new_oid = sync_commit(options).unwrap();
         let head_oid = dest_repo.head().unwrap().target().unwrap();
         assert_eq!(new_oid, head_oid);
+    }
+
+    #[test]
+    fn operations_already_applied_returns_true_for_matching_entries() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("file.txt");
+        fs::write(&source_path, "same").unwrap();
+        let dest_path = dest_dir.path().join("file.txt");
+        fs::write(&dest_path, "same").unwrap();
+
+        let operations = vec![
+            FileOp::Write {
+                source: source_path,
+                dest_relative: PathBuf::from("file.txt"),
+                filemode: 0o100644,
+                base: None,
+            },
+            FileOp::Delete {
+                dest_relative: PathBuf::from("gone.txt"),
+                base: BaseEntry {
+                    oid: Oid::zero(),
+                    filemode: 0o100644,
+                },
+            },
+        ];
+
+        assert!(operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[test]
+    fn operations_already_applied_returns_false_when_delete_exists() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let existing_path = dest_dir.path().join("exists.txt");
+        fs::write(&existing_path, "keep").unwrap();
+
+        let operations = vec![FileOp::Delete {
+            dest_relative: PathBuf::from("exists.txt"),
+            base: BaseEntry {
+                oid: Oid::zero(),
+                filemode: 0o100644,
+            },
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
     }
 
     #[test]
