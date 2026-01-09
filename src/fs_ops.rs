@@ -146,6 +146,50 @@ pub(crate) fn resolve_lfs_pointer(
     Ok(Some(object_path))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_lfs_pointer_returns_none_for_short_hash() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        fs::write(
+            &pointer,
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n",
+        )
+        .unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(&lfs_root))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_resolves_object_path() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let pointer_body =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n");
+        fs::write(&pointer, pointer_body).unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"real-content").unwrap();
+
+        let resolved = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap();
+        assert_eq!(resolved, Some(object_path));
+    }
+}
+
 pub(crate) fn set_executable_if_needed(dest: &Path, filemode: u32) -> Result<(), SyncError> {
     #[cfg(unix)]
     {
