@@ -1,5 +1,3 @@
-use std::process;
-
 use clap::{Parser, ValueEnum};
 use git2::Oid;
 
@@ -62,6 +60,9 @@ enum Mode {
     Patch,
     Copy,
 }
+
+#[cfg(not(test))]
+use std::process;
 
 #[cfg(not(test))]
 fn main() {

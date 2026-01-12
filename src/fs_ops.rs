@@ -146,6 +146,46 @@ pub(crate) fn resolve_lfs_pointer(
     Ok(Some(object_path))
 }
 
+pub(crate) fn set_executable_if_needed(dest: &Path, filemode: u32) -> Result<(), SyncError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = filemode & 0o111 != 0;
+        if let Ok(metadata) = fs::metadata(dest) {
+            let mut permissions = metadata.permissions();
+            let mut mode = permissions.mode();
+            let current_exec = mode & 0o111 != 0;
+            if executable != current_exec {
+                mode = if executable {
+                    mode | 0o111
+                } else {
+                    mode & !0o111
+                };
+                permissions.set_mode(mode);
+                fs::set_permissions(dest, permissions).map_err(|err| io_error(dest, err))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dest, filemode);
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+    if fs::metadata(target).map(|m| m.is_dir()).unwrap_or(false) {
+        symlink_dir(target, link)
+    } else {
+        symlink_file(target, link)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,45 +227,5 @@ mod tests {
 
         let resolved = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap();
         assert_eq!(resolved, Some(object_path));
-    }
-}
-
-pub(crate) fn set_executable_if_needed(dest: &Path, filemode: u32) -> Result<(), SyncError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let executable = filemode & 0o111 != 0;
-        if let Ok(metadata) = fs::metadata(dest) {
-            let mut permissions = metadata.permissions();
-            let mut mode = permissions.mode();
-            let current_exec = mode & 0o111 != 0;
-            if executable != current_exec {
-                mode = if executable {
-                    mode | 0o111
-                } else {
-                    mode & !0o111
-                };
-                permissions.set_mode(mode);
-                fs::set_permissions(dest, permissions).map_err(|err| io_error(dest, err))?;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = (dest, filemode);
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-pub(crate) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::{symlink_dir, symlink_file};
-    if fs::metadata(target).map(|m| m.is_dir()).unwrap_or(false) {
-        symlink_dir(target, link)
-    } else {
-        symlink_file(target, link)
     }
 }
