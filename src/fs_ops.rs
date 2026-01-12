@@ -130,9 +130,6 @@ pub(crate) fn resolve_lfs_pointer(
     let Some(hash) = oid else {
         return Ok(None);
     };
-    if hash.len() < 4 {
-        return Ok(None);
-    }
     let object_path = lfs_root
         .join(&hash[0..2])
         .join(&hash[2..4])

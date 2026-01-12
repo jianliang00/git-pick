@@ -1183,6 +1183,44 @@ mod tests {
     }
 
     #[test]
+    fn operations_already_applied_returns_false_for_content_mismatch() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("file.txt");
+        fs::write(&source_path, "source").unwrap();
+        let dest_path = dest_dir.path().join("file.txt");
+        fs::write(&dest_path, "dest").unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        assert!(!operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[test]
+    fn operations_already_applied_returns_false_for_missing_write_source() {
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+        let source_path = dest_dir.path().join("missing.txt");
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        let err = operations_already_applied(&operations, &dest_repo, None).unwrap_err();
+        assert!(matches!(err, SyncError::Io { .. }));
+    }
+
+    #[test]
     fn sync_with_mapping() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
