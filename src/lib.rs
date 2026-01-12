@@ -1208,6 +1208,7 @@ mod tests {
         let dest_dir = tempdir().unwrap();
         let dest_repo = init_repo(dest_dir.path());
         let source_path = dest_dir.path().join("missing.txt");
+        fs::write(dest_dir.path().join("file.txt"), "dest").unwrap();
 
         let operations = vec![FileOp::Write {
             source: source_path,
