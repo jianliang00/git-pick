@@ -923,6 +923,25 @@ mod tests {
     }
 
     #[test]
+    fn mapping_apply_with_empty_source_prefix() {
+        let mapping = PathMapping::new(PathBuf::new(), PathBuf::from("dest")).unwrap();
+        let mapped = mapping.apply(Path::new("file.txt")).unwrap();
+        assert_eq!(mapped, PathBuf::from("dest/file.txt"));
+    }
+
+    #[test]
+    fn mapping_parse_rejects_invalid_format() {
+        let err = PathMapping::parse("invalid").unwrap_err();
+        assert!(matches!(err, SyncError::InvalidMapping { .. }));
+    }
+
+    #[test]
+    fn normalize_relative_path_rejects_parent_dir() {
+        let err = normalize_relative_path(Path::new("../bad")).unwrap_err();
+        assert!(matches!(err, SyncError::InvalidRelativePath { .. }));
+    }
+
+    #[test]
     fn sync_basic_commit() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
