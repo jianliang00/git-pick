@@ -225,4 +225,20 @@ mod tests {
         let resolved = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap();
         assert_eq!(resolved, Some(object_path));
     }
+
+    #[test]
+    fn resolve_lfs_pointer_reports_missing_object() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let pointer_body =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n");
+        fs::write(&pointer, pointer_body).unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        let err = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap_err();
+        assert!(matches!(err, SyncError::MissingLfsObject { .. }));
+    }
 }

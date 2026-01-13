@@ -1274,6 +1274,32 @@ mod tests {
     }
 
     #[test]
+    fn sync_fails_when_destination_is_dirty() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("Dirty", 1_500_000_001);
+        write_and_stage(&source_repo, Path::new("file.txt"), "hello");
+        let oid = commit(&source_repo, "initial", &sig);
+
+        fs::write(dest_dir.path().join("untracked.txt"), "dirty").unwrap();
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::DirtyDestination));
+    }
+
+    #[test]
     fn sync_handles_deletions() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
