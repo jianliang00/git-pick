@@ -1241,6 +1241,67 @@ mod tests {
     }
 
     #[test]
+    fn operations_already_applied_resolves_lfs_pointer() {
+        let temp_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let lfs_root = temp_dir.path().join("lfs").join("objects");
+        let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"real-content").unwrap();
+
+        let pointer_path = temp_dir.path().join("pointer");
+        fs::write(
+            &pointer_path,
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n"),
+        )
+        .unwrap();
+
+        fs::write(dest_dir.path().join("file.txt"), b"real-content").unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: pointer_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        assert!(operations_already_applied(&operations, &dest_repo, Some(&lfs_root)).unwrap());
+    }
+
+    #[test]
+    fn operations_already_applied_reports_missing_lfs_object() {
+        let temp_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let lfs_root = temp_dir.path().join("lfs").join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        let pointer_path = temp_dir.path().join("pointer");
+        fs::write(
+            &pointer_path,
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n"),
+        )
+        .unwrap();
+
+        fs::write(dest_dir.path().join("file.txt"), b"real-content").unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: pointer_path,
+            dest_relative: PathBuf::from("file.txt"),
+            filemode: 0o100644,
+            base: None,
+        }];
+
+        let err = operations_already_applied(&operations, &dest_repo, Some(&lfs_root)).unwrap_err();
+        assert!(matches!(err, SyncError::MissingLfsObject { .. }));
+    }
+
+    #[test]
     fn sync_with_mapping() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
