@@ -942,6 +942,25 @@ mod tests {
     }
 
     #[test]
+    fn normalize_relative_path_handles_curdir() {
+        let normalized = normalize_relative_path(Path::new("./a/./b")).unwrap();
+        assert_eq!(normalized, PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn map_destination_returns_original_when_no_mapping() {
+        let mapped = map_destination(Path::new("a/b"), &[]);
+        assert_eq!(mapped, PathBuf::from("a/b"));
+    }
+
+    #[test]
+    fn mapping_apply_with_empty_dest_prefix() {
+        let mapping = PathMapping::new(PathBuf::from("src"), PathBuf::new()).unwrap();
+        let mapped = mapping.apply(Path::new("src/file.txt")).unwrap();
+        assert_eq!(mapped, PathBuf::from("file.txt"));
+    }
+
+    #[test]
     fn sync_basic_commit() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
