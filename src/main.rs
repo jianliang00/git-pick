@@ -1,5 +1,3 @@
-use std::process;
-
 use clap::{Parser, ValueEnum};
 use git2::Oid;
 
@@ -51,6 +49,10 @@ struct Args {
     /// Synchronization mode used to apply changes to the destination
     #[arg(long, value_name = "MODE", value_enum, default_value_t = Mode::Patch)]
     mode: Mode,
+
+    /// Allow already-synchronized commits without treating them as errors
+    #[arg(long)]
+    allow_empty: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -59,6 +61,10 @@ enum Mode {
     Copy,
 }
 
+#[cfg(not(test))]
+use std::process;
+
+#[cfg(not(test))]
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -66,8 +72,13 @@ fn main() {
     }
 }
 
+#[cfg(not(test))]
 fn run() -> Result<(), SyncError> {
     let args = Args::parse();
+    run_with_args(args)
+}
+
+fn run_with_args(args: Args) -> Result<(), SyncError> {
     let options = build_options(args)?;
     sync_commit(options).map(|_| ())
 }
@@ -84,6 +95,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         committer_name,
         committer_email,
         mode,
+        allow_empty,
     } = args;
 
     let oid = Oid::from_str(&commit).map_err(|source| SyncError::InvalidCommitId {
@@ -100,6 +112,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         Mode::Patch => SyncMode::Patch,
         Mode::Copy => SyncMode::Copy,
     };
+    options.allow_empty = allow_empty;
 
     Ok(options)
 }
@@ -107,6 +120,8 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{RepositoryInitOptions, Signature, Time};
+    use tempfile::tempdir;
 
     fn parse_args<I, T>(iter: I) -> Args
     where
@@ -131,6 +146,7 @@ mod tests {
         assert_eq!(options.mode, SyncMode::Patch);
         assert!(options.author_name.is_none());
         assert!(options.committer_email.is_none());
+        assert!(!options.allow_empty);
     }
 
     #[test]
@@ -153,6 +169,7 @@ mod tests {
             "Committer",
             "--committer-email",
             "committer@example.com",
+            "--allow-empty",
         ]);
         let options = build_options(args).unwrap();
         assert_eq!(options.mode, SyncMode::Copy);
@@ -163,6 +180,7 @@ mod tests {
             options.committer_email.as_deref(),
             Some("committer@example.com")
         );
+        assert!(options.allow_empty);
     }
 
     #[test]
@@ -178,5 +196,70 @@ mod tests {
         ]);
         let err = build_options(args).unwrap_err();
         assert!(matches!(err, SyncError::InvalidCommitId { .. }));
+    }
+
+    fn init_repo(path: &std::path::Path) -> git2::Repository {
+        let mut opts = RepositoryInitOptions::new();
+        opts.initial_head("main");
+        git2::Repository::init_opts(path, &opts).unwrap()
+    }
+
+    fn test_signature(name: &str, time: i64) -> Signature<'static> {
+        Signature::new(
+            name,
+            &format!("{}@example.com", name.to_lowercase()),
+            &Time::new(time, 60),
+        )
+        .unwrap()
+    }
+
+    fn write_and_stage(repo: &git2::Repository, path: &std::path::Path, content: &str) {
+        let full_path = repo.workdir().unwrap().join(path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full_path, content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(path).unwrap();
+        index.write().unwrap();
+    }
+
+    fn commit(repo: &git2::Repository, message: &str, sig: &Signature) -> Oid {
+        let mut index = repo.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parents = match repo.head() {
+            Ok(head) => vec![head.peel_to_commit().unwrap()],
+            Err(_) => Vec::new(),
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), sig, sig, message, &tree, &parent_refs)
+            .unwrap()
+    }
+
+    #[test]
+    fn run_with_args_executes_sync() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("Dana", 1_700_000_000);
+        write_and_stage(&source_repo, std::path::Path::new("file.txt"), "hello");
+        let oid = commit(&source_repo, "initial", &sig);
+
+        let args = parse_args([
+            "git-pick",
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &oid.to_string(),
+        ]);
+
+        run_with_args(args).unwrap();
+        let contents = std::fs::read_to_string(dest_dir.path().join("file.txt")).unwrap();
+        assert_eq!(contents, "hello");
     }
 }

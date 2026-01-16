@@ -14,16 +14,9 @@ fn io_error(path: &Path, source: std::io::Error) -> SyncError {
 
 #[cfg(test)]
 pub(crate) fn read_entry_for_patch(path: &Path, filemode: u32) -> Result<Vec<u8>, SyncError> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| io_error(path, err))?;
-    if metadata.file_type().is_symlink() || filemode == 0o120000 {
-        let target = fs::read_link(path).map_err(|err| io_error(path, err))?;
-        Ok(os_str_to_bytes(target.as_os_str()))
-    } else {
-        fs::read(path).map_err(|err| io_error(path, err))
-    }
+    read_entry_bytes(path, filemode)
 }
 
-#[cfg(test)]
 pub(crate) fn os_str_to_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
@@ -42,6 +35,16 @@ pub(crate) fn create_temp_dir_for(context: &Path) -> Result<TempDir, SyncError> 
 
 pub(crate) fn create_dir_all(path: &Path) -> Result<(), SyncError> {
     fs::create_dir_all(path).map_err(|err| io_error(path, err))
+}
+
+pub(crate) fn read_entry_bytes(path: &Path, filemode: u32) -> Result<Vec<u8>, SyncError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| io_error(path, err))?;
+    if metadata.file_type().is_symlink() || filemode == 0o120000 {
+        let target = fs::read_link(path).map_err(|err| io_error(path, err))?;
+        Ok(os_str_to_bytes(target.as_os_str()))
+    } else {
+        fs::read(path).map_err(|err| io_error(path, err))
+    }
 }
 
 pub(crate) fn remove_dir_all(path: &Path) -> Result<(), SyncError> {
@@ -127,9 +130,6 @@ pub(crate) fn resolve_lfs_pointer(
     let Some(hash) = oid else {
         return Ok(None);
     };
-    if hash.len() < 4 {
-        return Ok(None);
-    }
     let object_path = lfs_root
         .join(&hash[0..2])
         .join(&hash[2..4])
@@ -180,5 +180,65 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> 
         symlink_dir(target, link)
     } else {
         symlink_file(target, link)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolve_lfs_pointer_returns_none_for_short_hash() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        fs::write(
+            &pointer,
+            "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n",
+        )
+        .unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        assert!(
+            resolve_lfs_pointer(&pointer, Some(&lfs_root))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_resolves_object_path() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let pointer_body =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n");
+        fs::write(&pointer, pointer_body).unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        let object_path = lfs_root.join(&hash[0..2]).join(&hash[2..4]).join(hash);
+        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        fs::write(&object_path, b"real-content").unwrap();
+
+        let resolved = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap();
+        assert_eq!(resolved, Some(object_path));
+    }
+
+    #[test]
+    fn resolve_lfs_pointer_reports_missing_object() {
+        let dir = tempdir().unwrap();
+        let pointer = dir.path().join("pointer");
+        let hash = "2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70819";
+        let pointer_body =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{hash}\n");
+        fs::write(&pointer, pointer_body).unwrap();
+
+        let lfs_root = dir.path().join("objects");
+        fs::create_dir_all(&lfs_root).unwrap();
+
+        let err = resolve_lfs_pointer(&pointer, Some(&lfs_root)).unwrap_err();
+        assert!(matches!(err, SyncError::MissingLfsObject { .. }));
     }
 }
