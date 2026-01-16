@@ -1195,6 +1195,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn operations_already_applied_returns_true_for_matching_symlinks() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let dest_repo = init_repo(dest_dir.path());
+
+        let source_path = source_dir.path().join("link.txt");
+        let dest_path = dest_dir.path().join("link.txt");
+        std::os::unix::fs::symlink("target", &source_path).unwrap();
+        std::os::unix::fs::symlink("target", &dest_path).unwrap();
+
+        let operations = vec![FileOp::Write {
+            source: source_path,
+            dest_relative: PathBuf::from("link.txt"),
+            filemode: 0o120000,
+            base: None,
+        }];
+
+        assert!(operations_already_applied(&operations, &dest_repo, None).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn operations_already_applied_returns_false_for_exec_mismatch() {
         use std::os::unix::fs::PermissionsExt;
 
