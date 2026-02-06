@@ -310,6 +310,125 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     Ok(oid)
 }
 
+pub fn sync_commit_all(options: SyncOptions) -> Result<Vec<Oid>, SyncError> {
+    let source_repo =
+        Repository::open(&options.source_repo).map_err(|source| SyncError::SourceOpen {
+            path: options.source_repo.clone(),
+            source,
+        })?;
+    let dest_repo = Repository::open(&options.dest_repo).map_err(|source| SyncError::DestOpen {
+        path: options.dest_repo.clone(),
+        source,
+    })?;
+
+    if dest_repo.is_bare() {
+        return Err(SyncError::BareDestination);
+    }
+    ensure_destination_clean(&dest_repo)?;
+
+    let mut pending = Vec::new();
+    let mut current =
+        source_repo
+            .find_commit(options.commit)
+            .map_err(|source| SyncError::CommitLookup {
+                commit: options.commit.to_string(),
+                source,
+            })?;
+
+    loop {
+        if current.parent_count() > 1 {
+            return Err(SyncError::MergeCommit {
+                commit: current.id().to_string(),
+            });
+        }
+
+        let mut commit_options = options.clone();
+        commit_options.commit = current.id();
+
+        if is_commit_already_synced(&commit_options)? {
+            break;
+        }
+        pending.push(current.id());
+
+        if current.parent_count() == 0 {
+            break;
+        }
+        current = current.parent(0)?;
+    }
+
+    pending.reverse();
+    let mut synced = Vec::new();
+    for commit in pending {
+        let mut commit_options = options.clone();
+        commit_options.commit = commit;
+        let oid = sync_commit(commit_options)?;
+        synced.push(oid);
+    }
+
+    Ok(synced)
+}
+
+fn is_commit_already_synced(options: &SyncOptions) -> Result<bool, SyncError> {
+    let source_repo =
+        Repository::open(&options.source_repo).map_err(|source| SyncError::SourceOpen {
+            path: options.source_repo.clone(),
+            source,
+        })?;
+    let dest_repo = Repository::open(&options.dest_repo).map_err(|source| SyncError::DestOpen {
+        path: options.dest_repo.clone(),
+        source,
+    })?;
+
+    if dest_repo.is_bare() {
+        return Err(SyncError::BareDestination);
+    }
+
+    let commit =
+        source_repo
+            .find_commit(options.commit)
+            .map_err(|source| SyncError::CommitLookup {
+                commit: options.commit.to_string(),
+                source,
+            })?;
+
+    if commit.parent_count() > 1 {
+        return Err(SyncError::MergeCommit {
+            commit: options.commit.to_string(),
+        });
+    }
+
+    let commit_tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() == 1 {
+        commit.parent(0)?.tree()?
+    } else {
+        let empty_tree_id = source_repo.treebuilder(None)?.write()?;
+        source_repo.find_tree(empty_tree_id)?
+    };
+
+    let temp_dir = fs_ops::create_temp_dir_for(&options.source_repo)?;
+    checkout_to_temp(&source_repo, &commit, temp_dir.path())?;
+
+    let mut diff_options = DiffOptions::new();
+    diff_options.include_typechange(true);
+    diff_options.include_typechange_trees(true);
+    let mut diff = source_repo.diff_tree_to_tree(
+        Some(&parent_tree),
+        Some(&commit_tree),
+        Some(&mut diff_options),
+    )?;
+    diff.find_similar(None)?;
+
+    let operations = collect_operations(&diff, temp_dir.path(), options)?;
+    let lfs_store = source_repo.path().join("lfs").join("objects");
+    let lfs_store = if lfs_store.exists() {
+        Some(lfs_store)
+    } else {
+        None
+    };
+
+    operations_already_applied(&operations, &dest_repo, lfs_store.as_deref())
+}
+
 fn ensure_destination_clean(repo: &Repository) -> Result<(), SyncError> {
     let mut status_opts = StatusOptions::new();
     status_opts.include_untracked(true);

@@ -176,3 +176,56 @@ fn cli_rejects_invalid_commit() {
         .failure()
         .stderr(predicates::str::contains("failed to parse commit"));
 }
+
+#[test]
+fn cli_syncs_unpicked_ancestors_with_all_flag() {
+    let source_dir = tempdir().unwrap();
+    let dest_dir = tempdir().unwrap();
+    let source_repo = init_repo(source_dir.path());
+    init_repo(dest_dir.path());
+
+    write_and_stage(&source_repo, Path::new("file.txt"), "one\n");
+    let first = commit(&source_repo, "first");
+    write_and_stage(&source_repo, Path::new("file.txt"), "two\n");
+    let second = commit(&source_repo, "second");
+    write_and_stage(&source_repo, Path::new("file.txt"), "three\n");
+    let third = commit(&source_repo, "third");
+
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &first,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &third,
+            "--all",
+        ])
+        .assert()
+        .success();
+
+    let dest_repo = Repository::open(dest_dir.path()).unwrap();
+    let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.summary(), Some("third"));
+    assert_eq!(
+        fs::read_to_string(dest_dir.path().join("file.txt")).unwrap(),
+        "three\n"
+    );
+
+    let parent = head.parent(0).unwrap();
+    assert_eq!(parent.summary(), Some("second"));
+}
