@@ -214,14 +214,8 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
                 source,
             })?;
 
-    if commit.parent_count() > 1 {
-        return Err(SyncError::MergeCommit {
-            commit: options.commit.to_string(),
-        });
-    }
-
     let commit_tree = commit.tree()?;
-    let parent_tree = if commit.parent_count() == 1 {
+    let parent_tree = if commit.parent_count() >= 1 {
         commit.parent(0)?.tree()?
     } else {
         let empty_tree_id = source_repo.treebuilder(None)?.write()?;
@@ -336,17 +330,16 @@ pub fn sync_commit_all(options: SyncOptions) -> Result<Vec<Oid>, SyncError> {
             })?;
 
     loop {
-        if current.parent_count() > 1 {
-            return Err(SyncError::MergeCommit {
-                commit: current.id().to_string(),
-            });
-        }
-
         let mut commit_options = options.clone();
         commit_options.commit = current.id();
 
         if is_commit_already_synced(&commit_options)? {
             break;
+        }
+        if current.parent_count() > 1 {
+            return Err(SyncError::MergeCommit {
+                commit: current.id().to_string(),
+            });
         }
         pending.push(current.id());
 
@@ -391,14 +384,8 @@ fn is_commit_already_synced(options: &SyncOptions) -> Result<bool, SyncError> {
                 source,
             })?;
 
-    if commit.parent_count() > 1 {
-        return Err(SyncError::MergeCommit {
-            commit: options.commit.to_string(),
-        });
-    }
-
     let commit_tree = commit.tree()?;
-    let parent_tree = if commit.parent_count() == 1 {
+    let parent_tree = if commit.parent_count() >= 1 {
         commit.parent(0)?.tree()?
     } else {
         let empty_tree_id = source_repo.treebuilder(None)?.write()?;
