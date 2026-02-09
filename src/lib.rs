@@ -214,6 +214,12 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
                 source,
             })?;
 
+    if commit.parent_count() > 1 {
+        return Err(SyncError::MergeCommit {
+            commit: options.commit.to_string(),
+        });
+    }
+
     let commit_tree = commit.tree()?;
     let parent_tree = if commit.parent_count() >= 1 {
         commit.parent(0)?.tree()?
