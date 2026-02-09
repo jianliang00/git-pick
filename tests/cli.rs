@@ -290,7 +290,22 @@ fn cli_all_stops_at_already_synced_merge_boundary() {
     run_git(source_dir.path(), &["commit", "-m", "post"]);
 
     let post_oid = run_git(source_dir.path(), &["rev-parse", "HEAD"]);
+    let _merge_oid = run_git(source_dir.path(), &["rev-parse", "HEAD~1"]);
     let main2_oid = run_git(source_dir.path(), &["rev-parse", "HEAD~2"]);
+    let base_oid = run_git(source_dir.path(), &["rev-parse", "HEAD~3"]);
+
+    Command::cargo_bin("git-pick")
+        .unwrap()
+        .args([
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &base_oid,
+        ])
+        .assert()
+        .success();
 
     Command::cargo_bin("git-pick")
         .unwrap()
