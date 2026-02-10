@@ -272,4 +272,44 @@ mod tests {
         let contents = std::fs::read_to_string(dest_dir.path().join("file.txt")).unwrap();
         assert_eq!(contents, "hello");
     }
+    #[test]
+    fn run_with_args_executes_sync_all() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("Erin", 1_710_000_000);
+        write_and_stage(&source_repo, std::path::Path::new("file.txt"), "one");
+        let first = commit(&source_repo, "first", &sig);
+        write_and_stage(&source_repo, std::path::Path::new("file.txt"), "two");
+        let second = commit(&source_repo, "second", &sig);
+
+        let first_args = parse_args([
+            "git-pick",
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &first.to_string(),
+        ]);
+        run_with_args(first_args).unwrap();
+
+        let all_args = parse_args([
+            "git-pick",
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &second.to_string(),
+            "--all",
+        ]);
+        run_with_args(all_args).unwrap();
+
+        let dest_repo = git2::Repository::open(dest_dir.path()).unwrap();
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("second"));
+    }
 }

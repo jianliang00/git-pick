@@ -2000,6 +2000,153 @@ mod tests {
     }
 
     #[test]
+    fn sync_commit_all_replays_only_unpicked_ancestors() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("All", 1_940_000_000);
+
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "one
+",
+        );
+        let first = commit(&source_repo, "first", &sig);
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "two
+",
+        );
+        commit(&source_repo, "second", &sig);
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "three
+",
+        );
+        let third = commit(&source_repo, "third", &sig);
+
+        let first_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            first,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(first_options).unwrap();
+
+        let all_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            third,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let created = sync_commit_all(all_options).unwrap();
+        assert_eq!(created.len(), 2);
+
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("third"));
+        assert_eq!(head.parent(0).unwrap().summary(), Some("second"));
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("file.txt")).unwrap(),
+            "three
+"
+        );
+    }
+
+    #[test]
+    fn sync_commit_all_returns_empty_when_target_already_synced() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+        let sig = test_signature("AllEmpty", 1_950_000_000);
+
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "content
+",
+        );
+        let oid = commit(&source_repo, "only", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(options).unwrap();
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let created = sync_commit_all(options).unwrap();
+        assert!(created.is_empty());
+    }
+
+    #[test]
+    fn sync_commit_all_rejects_unsynced_merge_commit() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+        let sig = test_signature("AllMerge", 1_960_000_000);
+
+        write_and_stage(&source_repo, Path::new("base.txt"), "base");
+        let base = commit(&source_repo, "base", &sig);
+
+        write_and_stage(&source_repo, Path::new("left.txt"), "left");
+        let left = commit(&source_repo, "left", &sig);
+
+        source_repo.set_head_detached(base).unwrap();
+        write_and_stage(&source_repo, Path::new("right.txt"), "right");
+        let right = commit(&source_repo, "right", &sig);
+
+        let left_commit = source_repo.find_commit(left).unwrap();
+        let right_commit = source_repo.find_commit(right).unwrap();
+        let mut index = source_repo.index().unwrap();
+        index.read_tree(&left_commit.tree().unwrap()).unwrap();
+        index.read_tree(&right_commit.tree().unwrap()).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = source_repo.find_tree(tree_id).unwrap();
+        source_repo.set_head_detached(left).unwrap();
+        let merge_oid = source_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "merge",
+                &tree,
+                &[&left_commit, &right_commit],
+            )
+            .unwrap();
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            merge_oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::MergeCommit { .. }));
+    }
+    #[test]
     fn destination_dirty_is_rejected() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
