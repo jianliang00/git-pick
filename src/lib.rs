@@ -2146,6 +2146,64 @@ mod tests {
         let err = sync_commit_all(options).unwrap_err();
         assert!(matches!(err, SyncError::MergeCommit { .. }));
     }
+
+    #[test]
+    fn sync_commit_all_reports_source_open_error() {
+        let dest_dir = tempdir().unwrap();
+        init_repo(dest_dir.path());
+        let options = SyncOptions::new(
+            PathBuf::from("/path/does/not/exist"),
+            dest_dir.path().to_path_buf(),
+            Oid::zero(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::SourceOpen { .. }));
+    }
+
+    #[test]
+    fn sync_commit_all_reports_dest_open_error() {
+        let source_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let sig = test_signature("OpenErr", 1_970_000_000);
+        write_and_stage(&source_repo, Path::new("file.txt"), "content");
+        let oid = commit(&source_repo, "c1", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            PathBuf::from("/path/does/not/exist"),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::DestOpen { .. }));
+    }
+
+    #[test]
+    fn sync_commit_all_rejects_bare_destination() {
+        let source_dir = tempdir().unwrap();
+        let bare_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        Repository::init_bare(bare_dir.path()).unwrap();
+        let sig = test_signature("Bare", 1_980_000_000);
+        write_and_stage(&source_repo, Path::new("file.txt"), "content");
+        let oid = commit(&source_repo, "c1", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            bare_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::BareDestination));
+    }
     #[test]
     fn destination_dirty_is_rejected() {
         let source_dir = tempdir().unwrap();
