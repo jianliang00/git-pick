@@ -2204,6 +2204,102 @@ mod tests {
         let err = sync_commit_all(options).unwrap_err();
         assert!(matches!(err, SyncError::BareDestination));
     }
+
+    #[test]
+    fn sync_patch_conflicts_when_base_oid_mismatches() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchBase", 1_990_000_000);
+
+        write_and_stage(&source_repo, Path::new("file.txt"), "one");
+        let base = commit(&source_repo, "base", &sig);
+        write_and_stage(&source_repo, Path::new("file.txt"), "two");
+        let update = commit(&source_repo, "update", &sig);
+
+        let base_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            base,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(base_options).unwrap();
+
+        write_and_stage(&dest_repo, Path::new("file.txt"), "dest-change");
+        commit(&dest_repo, "diverge", &sig);
+
+        let update_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            update,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(update_options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
+
+    #[test]
+    fn sync_patch_conflicts_when_adding_existing_path() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchAdd", 2_000_000_000);
+
+        write_and_stage(&source_repo, Path::new("new.txt"), "source");
+        let add_commit = commit(&source_repo, "add", &sig);
+
+        write_and_stage(&dest_repo, Path::new("new.txt"), "dest");
+        commit(&dest_repo, "existing", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            add_commit,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
+
+    #[test]
+    fn sync_patch_conflicts_when_delete_base_missing_or_mismatch() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchDel", 2_010_000_000);
+
+        write_and_stage(&source_repo, Path::new("victim.txt"), "v1");
+        commit(&source_repo, "base", &sig);
+        fs::remove_file(source_dir.path().join("victim.txt")).unwrap();
+        write_and_stage(&source_repo, Path::new("added.txt"), "new");
+        let mut src_index = source_repo.index().unwrap();
+        src_index.remove_path(Path::new("victim.txt")).unwrap();
+        src_index.write().unwrap();
+        let delete_and_add = commit(&source_repo, "delete-and-add", &sig);
+
+        write_and_stage(&dest_repo, Path::new("victim.txt"), "different");
+        commit(&dest_repo, "dest-has-different", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            delete_and_add,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
     #[test]
     fn destination_dirty_is_rejected() {
         let source_dir = tempdir().unwrap();
