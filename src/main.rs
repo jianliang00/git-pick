@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use git2::Oid;
 
-use git_pick::{PathMapping, SyncError, SyncMode, SyncOptions, sync_commit};
+use git_pick::{PathMapping, SyncError, SyncMode, SyncOptions, sync_commit, sync_commit_all};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +53,10 @@ struct Args {
     /// Allow already-synchronized commits without treating them as errors
     #[arg(long)]
     allow_empty: bool,
+
+    /// Sync the commit and all unpicked first-parent ancestors
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -79,8 +83,13 @@ fn run() -> Result<(), SyncError> {
 }
 
 fn run_with_args(args: Args) -> Result<(), SyncError> {
+    let sync_all = args.all;
     let options = build_options(args)?;
-    sync_commit(options).map(|_| ())
+    if sync_all {
+        sync_commit_all(options).map(|_| ())
+    } else {
+        sync_commit(options).map(|_| ())
+    }
 }
 
 fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
@@ -96,6 +105,7 @@ fn build_options(args: Args) -> Result<SyncOptions, SyncError> {
         committer_email,
         mode,
         allow_empty,
+        all: _,
     } = args;
 
     let oid = Oid::from_str(&commit).map_err(|source| SyncError::InvalidCommitId {
@@ -261,5 +271,45 @@ mod tests {
         run_with_args(args).unwrap();
         let contents = std::fs::read_to_string(dest_dir.path().join("file.txt")).unwrap();
         assert_eq!(contents, "hello");
+    }
+    #[test]
+    fn run_with_args_executes_sync_all() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+
+        let sig = test_signature("Erin", 1_710_000_000);
+        write_and_stage(&source_repo, std::path::Path::new("file.txt"), "one");
+        let first = commit(&source_repo, "first", &sig);
+        write_and_stage(&source_repo, std::path::Path::new("file.txt"), "two");
+        let second = commit(&source_repo, "second", &sig);
+
+        let first_args = parse_args([
+            "git-pick",
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &first.to_string(),
+        ]);
+        run_with_args(first_args).unwrap();
+
+        let all_args = parse_args([
+            "git-pick",
+            "--source",
+            source_dir.path().to_str().unwrap(),
+            "--dest",
+            dest_dir.path().to_str().unwrap(),
+            "--commit",
+            &second.to_string(),
+            "--all",
+        ]);
+        run_with_args(all_args).unwrap();
+
+        let dest_repo = git2::Repository::open(dest_dir.path()).unwrap();
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("second"));
     }
 }

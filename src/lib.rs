@@ -221,7 +221,7 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     }
 
     let commit_tree = commit.tree()?;
-    let parent_tree = if commit.parent_count() == 1 {
+    let parent_tree = if commit.parent_count() >= 1 {
         commit.parent(0)?.tree()?
     } else {
         let empty_tree_id = source_repo.treebuilder(None)?.write()?;
@@ -308,6 +308,118 @@ pub fn sync_commit(options: SyncOptions) -> Result<Oid, SyncError> {
     )?;
 
     Ok(oid)
+}
+
+pub fn sync_commit_all(options: SyncOptions) -> Result<Vec<Oid>, SyncError> {
+    let source_repo =
+        Repository::open(&options.source_repo).map_err(|source| SyncError::SourceOpen {
+            path: options.source_repo.clone(),
+            source,
+        })?;
+    let dest_repo = Repository::open(&options.dest_repo).map_err(|source| SyncError::DestOpen {
+        path: options.dest_repo.clone(),
+        source,
+    })?;
+
+    if dest_repo.is_bare() {
+        return Err(SyncError::BareDestination);
+    }
+    ensure_destination_clean(&dest_repo)?;
+
+    let mut pending = Vec::new();
+    let mut current =
+        source_repo
+            .find_commit(options.commit)
+            .map_err(|source| SyncError::CommitLookup {
+                commit: options.commit.to_string(),
+                source,
+            })?;
+
+    loop {
+        let mut commit_options = options.clone();
+        commit_options.commit = current.id();
+
+        if is_commit_already_synced(&commit_options)? {
+            break;
+        }
+        if current.parent_count() > 1 {
+            return Err(SyncError::MergeCommit {
+                commit: current.id().to_string(),
+            });
+        }
+        pending.push(current.id());
+
+        if current.parent_count() == 0 {
+            break;
+        }
+        current = current.parent(0)?;
+    }
+
+    pending.reverse();
+    let mut synced = Vec::new();
+    for commit in pending {
+        let mut commit_options = options.clone();
+        commit_options.commit = commit;
+        let oid = sync_commit(commit_options)?;
+        synced.push(oid);
+    }
+
+    Ok(synced)
+}
+
+fn is_commit_already_synced(options: &SyncOptions) -> Result<bool, SyncError> {
+    let source_repo =
+        Repository::open(&options.source_repo).map_err(|source| SyncError::SourceOpen {
+            path: options.source_repo.clone(),
+            source,
+        })?;
+    let dest_repo = Repository::open(&options.dest_repo).map_err(|source| SyncError::DestOpen {
+        path: options.dest_repo.clone(),
+        source,
+    })?;
+
+    if dest_repo.is_bare() {
+        return Err(SyncError::BareDestination);
+    }
+
+    let commit =
+        source_repo
+            .find_commit(options.commit)
+            .map_err(|source| SyncError::CommitLookup {
+                commit: options.commit.to_string(),
+                source,
+            })?;
+
+    let commit_tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() >= 1 {
+        commit.parent(0)?.tree()?
+    } else {
+        let empty_tree_id = source_repo.treebuilder(None)?.write()?;
+        source_repo.find_tree(empty_tree_id)?
+    };
+
+    let temp_dir = fs_ops::create_temp_dir_for(&options.source_repo)?;
+    checkout_to_temp(&source_repo, &commit, temp_dir.path())?;
+
+    let mut diff_options = DiffOptions::new();
+    diff_options.include_typechange(true);
+    diff_options.include_typechange_trees(true);
+    let mut diff = source_repo.diff_tree_to_tree(
+        Some(&parent_tree),
+        Some(&commit_tree),
+        Some(&mut diff_options),
+    )?;
+    diff.find_similar(None)?;
+
+    let operations = collect_operations(&diff, temp_dir.path(), options)?;
+    let lfs_store = source_repo.path().join("lfs").join("objects");
+    let lfs_store = if lfs_store.exists() {
+        Some(lfs_store)
+    } else {
+        None
+    };
+
+    operations_already_applied(&operations, &dest_repo, lfs_store.as_deref())
 }
 
 fn ensure_destination_clean(repo: &Repository) -> Result<(), SyncError> {
@@ -1888,6 +2000,307 @@ mod tests {
     }
 
     #[test]
+    fn sync_commit_all_replays_only_unpicked_ancestors() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("All", 1_940_000_000);
+
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "one
+",
+        );
+        let first = commit(&source_repo, "first", &sig);
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "two
+",
+        );
+        commit(&source_repo, "second", &sig);
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "three
+",
+        );
+        let third = commit(&source_repo, "third", &sig);
+
+        let first_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            first,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(first_options).unwrap();
+
+        let all_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            third,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let created = sync_commit_all(all_options).unwrap();
+        assert_eq!(created.len(), 2);
+
+        let head = dest_repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("third"));
+        assert_eq!(head.parent(0).unwrap().summary(), Some("second"));
+        assert_eq!(
+            fs::read_to_string(dest_dir.path().join("file.txt")).unwrap(),
+            "three
+"
+        );
+    }
+
+    #[test]
+    fn sync_commit_all_returns_empty_when_target_already_synced() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+        let sig = test_signature("AllEmpty", 1_950_000_000);
+
+        write_and_stage(
+            &source_repo,
+            Path::new("file.txt"),
+            "content
+",
+        );
+        let oid = commit(&source_repo, "only", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(options).unwrap();
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let created = sync_commit_all(options).unwrap();
+        assert!(created.is_empty());
+    }
+
+    #[test]
+    fn sync_commit_all_rejects_unsynced_merge_commit() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        init_repo(dest_dir.path());
+        let sig = test_signature("AllMerge", 1_960_000_000);
+
+        write_and_stage(&source_repo, Path::new("base.txt"), "base");
+        let base = commit(&source_repo, "base", &sig);
+
+        write_and_stage(&source_repo, Path::new("left.txt"), "left");
+        let left = commit(&source_repo, "left", &sig);
+
+        source_repo.set_head_detached(base).unwrap();
+        write_and_stage(&source_repo, Path::new("right.txt"), "right");
+        let right = commit(&source_repo, "right", &sig);
+
+        let left_commit = source_repo.find_commit(left).unwrap();
+        let right_commit = source_repo.find_commit(right).unwrap();
+        let mut index = source_repo.index().unwrap();
+        index.read_tree(&left_commit.tree().unwrap()).unwrap();
+        index.read_tree(&right_commit.tree().unwrap()).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = source_repo.find_tree(tree_id).unwrap();
+        source_repo.set_head_detached(left).unwrap();
+        let merge_oid = source_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "merge",
+                &tree,
+                &[&left_commit, &right_commit],
+            )
+            .unwrap();
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            merge_oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::MergeCommit { .. }));
+    }
+
+    #[test]
+    fn sync_commit_all_reports_source_open_error() {
+        let dest_dir = tempdir().unwrap();
+        init_repo(dest_dir.path());
+        let options = SyncOptions::new(
+            PathBuf::from("/path/does/not/exist"),
+            dest_dir.path().to_path_buf(),
+            Oid::zero(),
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::SourceOpen { .. }));
+    }
+
+    #[test]
+    fn sync_commit_all_reports_dest_open_error() {
+        let source_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let sig = test_signature("OpenErr", 1_970_000_000);
+        write_and_stage(&source_repo, Path::new("file.txt"), "content");
+        let oid = commit(&source_repo, "c1", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            PathBuf::from("/path/does/not/exist"),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::DestOpen { .. }));
+    }
+
+    #[test]
+    fn sync_commit_all_rejects_bare_destination() {
+        let source_dir = tempdir().unwrap();
+        let bare_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        Repository::init_bare(bare_dir.path()).unwrap();
+        let sig = test_signature("Bare", 1_980_000_000);
+        write_and_stage(&source_repo, Path::new("file.txt"), "content");
+        let oid = commit(&source_repo, "c1", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            bare_dir.path().to_path_buf(),
+            oid,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit_all(options).unwrap_err();
+        assert!(matches!(err, SyncError::BareDestination));
+    }
+
+    #[test]
+    fn sync_patch_conflicts_when_base_oid_mismatches() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchBase", 1_990_000_000);
+
+        write_and_stage(&source_repo, Path::new("file.txt"), "one");
+        let base = commit(&source_repo, "base", &sig);
+        write_and_stage(&source_repo, Path::new("file.txt"), "two");
+        let update = commit(&source_repo, "update", &sig);
+
+        let base_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            base,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        sync_commit(base_options).unwrap();
+
+        write_and_stage(&dest_repo, Path::new("file.txt"), "dest-change");
+        commit(&dest_repo, "diverge", &sig);
+
+        let update_options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            update,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(update_options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
+
+    #[test]
+    fn sync_patch_conflicts_when_adding_existing_path() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchAdd", 2_000_000_000);
+
+        write_and_stage(&source_repo, Path::new("new.txt"), "source");
+        let add_commit = commit(&source_repo, "add", &sig);
+
+        write_and_stage(&dest_repo, Path::new("new.txt"), "dest");
+        commit(&dest_repo, "existing", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            add_commit,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
+
+    #[test]
+    fn sync_patch_conflicts_when_delete_base_missing_or_mismatch() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("PatchDel", 2_010_000_000);
+
+        write_and_stage(&source_repo, Path::new("victim.txt"), "v1");
+        commit(&source_repo, "base", &sig);
+        fs::remove_file(source_dir.path().join("victim.txt")).unwrap();
+        write_and_stage(&source_repo, Path::new("added.txt"), "new");
+        let mut src_index = source_repo.index().unwrap();
+        src_index.remove_path(Path::new("victim.txt")).unwrap();
+        src_index.write().unwrap();
+        let delete_and_add = commit(&source_repo, "delete-and-add", &sig);
+
+        write_and_stage(&dest_repo, Path::new("victim.txt"), "different");
+        commit(&dest_repo, "dest-has-different", &sig);
+
+        let options = SyncOptions::new(
+            source_dir.path().to_path_buf(),
+            dest_dir.path().to_path_buf(),
+            delete_and_add,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let err = sync_commit(options).unwrap_err();
+        assert!(matches!(err, SyncError::Git(_)));
+    }
+    #[test]
     fn destination_dirty_is_rejected() {
         let source_dir = tempdir().unwrap();
         let dest_dir = tempdir().unwrap();
@@ -2244,6 +2657,62 @@ mod tests {
         let dest_repo = init_repo(dest_dir.path());
 
         apply_operations_patch(&source_repo, &dest_repo, &[]).unwrap();
+    }
+
+    #[test]
+    fn apply_operations_patch_delete_conflicts_without_head_commit() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        let operations = vec![FileOp::Delete {
+            dest_relative: PathBuf::from("missing.txt"),
+            base: BaseEntry {
+                oid: Oid::from_bytes(&[1; 20]).unwrap(),
+                filemode: 0o100644,
+            },
+        }];
+
+        let err = apply_operations_patch(&source_repo, &dest_repo, &operations).unwrap_err();
+        assert_eq!(err.to_string(), "conflicted delta is not supported");
+    }
+
+    #[test]
+    fn apply_operations_patch_delete_removes_directory_at_target_path() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("Patch", 1_930_000_000);
+
+        write_and_stage(&dest_repo, Path::new("victim"), "tracked");
+        commit(&dest_repo, "base", &sig);
+
+        let head_tree = dest_repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = head_tree.get_path(Path::new("victim")).unwrap();
+
+        let victim_path = dest_dir.path().join("victim");
+        fs::remove_file(&victim_path).unwrap();
+        fs::create_dir(&victim_path).unwrap();
+        fs::write(victim_path.join("nested.txt"), "nested").unwrap();
+
+        let operations = vec![FileOp::Delete {
+            dest_relative: PathBuf::from("victim"),
+            base: BaseEntry {
+                oid: entry.id(),
+                filemode: entry.filemode() as u32,
+            },
+        }];
+
+        apply_operations_patch(&source_repo, &dest_repo, &operations).unwrap();
+        assert!(!victim_path.exists());
     }
 
     #[test]

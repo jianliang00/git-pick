@@ -60,6 +60,7 @@ git-pick --source <PATH> --dest <PATH> --commit <OID> [--map <SRC=DEST> ...] [--
 - `--author-name` / `--author-email` – optional overrides for the author information of the replayed commit.
 - `--committer-name` / `--committer-email` – optional overrides for the committer information of the replayed commit.
 - `--allow-empty` – treat already-synchronised commits as warnings instead of errors.
+- `--all` – sync the selected commit and unpicked first-parent ancestors until the first commit that is already synchronised.
 
 ### Example
 
