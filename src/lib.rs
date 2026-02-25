@@ -2660,6 +2660,62 @@ mod tests {
     }
 
     #[test]
+    fn apply_operations_patch_delete_conflicts_without_head_commit() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+
+        let operations = vec![FileOp::Delete {
+            dest_relative: PathBuf::from("missing.txt"),
+            base: BaseEntry {
+                oid: Oid::from_bytes(&[1; 20]).unwrap(),
+                filemode: 0o100644,
+            },
+        }];
+
+        let err = apply_operations_patch(&source_repo, &dest_repo, &operations).unwrap_err();
+        assert_eq!(err.to_string(), "conflicted delta is not supported");
+    }
+
+    #[test]
+    fn apply_operations_patch_delete_removes_directory_at_target_path() {
+        let source_dir = tempdir().unwrap();
+        let dest_dir = tempdir().unwrap();
+        let source_repo = init_repo(source_dir.path());
+        let dest_repo = init_repo(dest_dir.path());
+        let sig = test_signature("Patch", 1_930_000_000);
+
+        write_and_stage(&dest_repo, Path::new("victim"), "tracked");
+        commit(&dest_repo, "base", &sig);
+
+        let head_tree = dest_repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = head_tree.get_path(Path::new("victim")).unwrap();
+
+        let victim_path = dest_dir.path().join("victim");
+        fs::remove_file(&victim_path).unwrap();
+        fs::create_dir(&victim_path).unwrap();
+        fs::write(victim_path.join("nested.txt"), "nested").unwrap();
+
+        let operations = vec![FileOp::Delete {
+            dest_relative: PathBuf::from("victim"),
+            base: BaseEntry {
+                oid: entry.id(),
+                filemode: entry.filemode() as u32,
+            },
+        }];
+
+        apply_operations_patch(&source_repo, &dest_repo, &operations).unwrap();
+        assert!(!victim_path.exists());
+    }
+
+    #[test]
     fn path_mapping_new_normalizes_inputs() {
         let mapping =
             PathMapping::new(PathBuf::from("./foo/./bar"), PathBuf::from("dest/.")).unwrap();
